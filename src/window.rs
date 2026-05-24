@@ -136,7 +136,7 @@ fn ensure_sprite(
                 mip_level_count:   1,
                 sample_count:      1,
                 dimension:         wgpu::TextureDimension::D2,
-                format:            wgpu::TextureFormat::Rgba8Unorm,
+                format:            wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage:             wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats:      &[],
             });
@@ -250,6 +250,7 @@ struct WindowInner {
     // Per-frame draw queue
     draw_queue:          Vec<DrawCommand>,
     sprite_cache:        HashMap<u32, SpriteGpuData>,
+    sprite_bg_cache:     HashMap<(u32, Option<u32>), Arc<wgpu::BindGroup>>,
     mask:                Option<(i32, i32, u32)>,
     blend:               BlendMode,
     transparent:         bool,
@@ -616,8 +617,9 @@ impl Window {
             color_pipeline,
             sampler, dummy_texture, dummy_view,
             sprite_vbuf,
-            draw_queue:   Vec::new(),
-            sprite_cache: HashMap::new(),
+            draw_queue:      Vec::new(),
+            sprite_cache:    HashMap::new(),
+            sprite_bg_cache: HashMap::new(),
             mask:         None,
             blend:        BlendMode::Normal,
             transparent:  self.transparent,
@@ -729,16 +731,19 @@ impl Window {
             None
         };
 
-        // ⑤ Build bind groups for sprite draws before starting render pass
-        let mut sprite_bgs: Vec<wgpu::BindGroup> = Vec::new();
+        // ⑤ Build bind groups for sprite draws (cached by texture+mask combination)
+        let mut sprite_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
         for item in &items {
             if let RItem::Sprite { handle, mask_handle, .. } = item {
-                if let Some(sprite_gd) = inner.sprite_cache.get(handle) {
+                let key = (*handle, *mask_handle);
+                if let Some(cached) = inner.sprite_bg_cache.get(&key) {
+                    sprite_bgs.push(Arc::clone(cached));
+                } else if let Some(sprite_gd) = inner.sprite_cache.get(handle) {
                     let mask_view = mask_handle
                         .and_then(|mh| inner.sprite_cache.get(&mh))
                         .map(|md| &md.view)
                         .unwrap_or(&inner.dummy_view);
-                    sprite_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                    let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label:   None,
                         layout:  &inner.sprite_bgl,
                         entries: &[
@@ -747,6 +752,8 @@ impl Window {
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
                         ],
                     }));
+                    inner.sprite_bg_cache.insert(key, Arc::clone(&bg));
+                    sprite_bgs.push(bg);
                 }
             }
         }
@@ -759,7 +766,7 @@ impl Window {
                 size:            wgpu::Extent3d { width: ti.width, height: ti.height, depth_or_array_layers: 1 },
                 mip_level_count: 1, sample_count: 1,
                 dimension:       wgpu::TextureDimension::D2,
-                format:          wgpu::TextureFormat::Rgba8Unorm,
+                format:          wgpu::TextureFormat::Rgba8UnormSrgb,
                 usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
                 view_formats:    &[],
             });
@@ -833,7 +840,7 @@ impl Window {
                                 BlendMode::Mul    => &inner.sprite_pipeline_mul,
                             };
                             rpass.set_pipeline(pipeline);
-                            rpass.set_bind_group(0, &sprite_bgs[sprite_bg_idx], &[]);
+                            rpass.set_bind_group(0, &*sprite_bgs[sprite_bg_idx], &[]);
                             rpass.set_vertex_buffer(0, inner.sprite_vbuf.slice(..));
                             rpass.draw(*base..*base + 6, 0..1);
                             sprite_bg_idx += 1;

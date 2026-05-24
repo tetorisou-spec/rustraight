@@ -23,13 +23,35 @@ fn main() {
     // window.font_file("font.ttf");
     window.font_size(16);
 
+    // 4. 1秒間のデルタタイム保存ベクター
+    let mut dt_holder: Vec<f32> = Vec::new();
+    let mut frame_rate = 0.0;
+
     // メインループ
     while window.advance_frame() {
+        // デルタタイム取得
+        let dt = window.delta_time();
+        dt_holder.push(dt);
+
+        // nフレームに1回
+        if dt_holder.len() == 30 {
+            // 平均デルタタイムを取る
+            let mut average_dt = 0.0;
+            for past_dt in &dt_holder {
+                average_dt += past_dt;
+            }
+            average_dt /= dt_holder.len() as f32;
+
+            // フレームレート計算
+            frame_rate = 1.0 / average_dt;
+
+            dt_holder.clear();
+        }
+
         // 描画
         window.screen_clear();
-
         // フレームレート表示
-        window.screen_draw_text(0, 0, format!("経過秒数: {:.3}", window.elapsed_time()), Color::WHITE);
+        window.screen_draw_text(0, 0, format!("fps: {:.2}", frame_rate), Color::WHITE);
     }
 
     // 解放
