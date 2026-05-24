@@ -1,0 +1,26 @@
+[package]
+name        = "rustraight"
+version     = "0.1.0"
+edition     = "2024"
+description = "A simple 2D game library for Rust, inspired by DXLib"
+license     = "MIT"
+repository  = "https://github.com/tetorisou-spec/rustraight.git"
+keywords    = ["game", "gamedev", "2d", "wgpu", "graphics"]
+categories  = ["game-engines"]
+
+[lib]
+name = "rustraight"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rustraight_demo"
+path = "src/main.rs"
+
+[dependencies]
+wgpu     = "24"
+winit    = "0.30"
+image    = { version = "0.25", default-features = false, features = ["png"] }
+pollster = "0.4"
+gilrs    = "0.10"
+rodio    = "0.20"
+fontdue  = "0.7"
