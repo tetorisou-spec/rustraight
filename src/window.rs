@@ -906,6 +906,7 @@ impl Window {
     pub fn is_just_pressed(&self, key: KeyCode) -> bool { crate::input::is_just_pressed(key) }
     pub fn is_released(&self, key: KeyCode) -> bool     { crate::input::is_released(key) }
     pub fn delta_time(&self) -> f32                     { crate::time::get_delta_time() }
+    pub fn elapsed_time(&self) -> f64                   { crate::time::get_elapsed_secs() }
 
     // ── Mouse ─────────────────────────────────────────────────────────────────
 
