@@ -3,57 +3,58 @@
 [![Crates.io](https://img.shields.io/crates/v/rustraight)](https://crates.io/crates/rustraight)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
 
-A simple 2D game library for Rust, inspired by [DXLib](https://dxlib.xsrv.jp/).
+[DXLib](https://dxlib.xsrv.jp/) にインスパイアされた、Rust 向けシンプル 2D ゲームライブラリです。
 
-rustraight is built on [wgpu](https://wgpu.rs/) and [winit](https://github.com/rust-windowing/winit), providing a beginner-friendly API for making 2D games without dealing with low-level GPU details.
+[wgpu](https://wgpu.rs/) と [winit](https://github.com/rust-windowing/winit) を基盤とし、GPU の低レイヤな知識なしに 2D ゲームを作れる入門者向け API を提供します。
 
-## Features
+## 特徴
 
-- **Window & virtual screen** — Create a window with an independent virtual resolution that scales to any window size
-- **Sprite rendering** — Load PNG images and draw them with scale, rotation, alpha, and flip
-- **Sprite sheets** — Split a sprite sheet into individual sprites with `load_div_graph`
-- **Shape drawing** — Pixels, lines, rectangles, circles, triangles (filled or outline)
-- **Blend modes** — Normal, Additive, Multiply
-- **Sub-screen** — Off-screen render targets you can draw onto and use as sprites
-- **Keyboard & mouse input** — Pressed / just-pressed / released state for every key and button
-- **Gamepad input** — Buttons and analog sticks via [gilrs](https://gitlab.com/gilrs-project/gilrs)
-- **Sound** — Load and play WAV, OGG, MP3, and FLAC files via [rodio](https://github.com/RustAudio/rodio)
-- **Text rendering** — Draw text using system fonts or a custom TTF/OTF file via [fontdue](https://github.com/mooman219/fontdue)
-- **Delta time & elapsed time** — Frame-rate independent movement out of the box
+- **ウィンドウ & 仮想スクリーン** — ウィンドウサイズに依存しない独立した仮想解像度でゲームロジックを記述
+- **スプライト描画** — PNG 画像の読み込みとスケール / 回転 / アルファ / 反転付き描画
+- **スプライトシート** — `load_div_graph` でスプライトシートを個別スプライトに分割
+- **図形描画** — ピクセル・線・矩形・円・三角形（塗りつぶし・アウトライン）
+- **ブレンドモード** — 通常 / 加算 / 乗算
+- **サブスクリーン** — オフスクリーンレンダーターゲットをスプライトとして利用
+- **キーボード & マウス入力** — 押している / 押した瞬間 / 離した瞬間を全キー・ボタンで判定
+- **ゲームパッド入力** — ボタンとアナログスティック ([gilrs](https://gitlab.com/gilrs-project/gilrs) 経由)
+- **サウンド** — WAV / OGG / MP3 / FLAC の読み込み・再生 ([rodio](https://github.com/RustAudio/rodio) 経由)
+- **テキスト描画** — システムフォントまたはカスタム TTF/OTF ファイルによる文字描画 ([fontdue](https://github.com/mooman219/fontdue) 経由)
+- **デルタタイム & 経過時間** — フレームレート非依存の移動処理を標準サポート
+- **オーバーレイウィンドウ** (Windows 限定) — メインウィンドウの外側（全画面）に描画できる透過オーバーレイ
 
-## Installation
+## インストール
 
-Add the following to your `Cargo.toml`:
+`Cargo.toml` に以下を追加してください：
 
 ```toml
 [dependencies]
-rustraight = "0.1"
+rustraight = "0.2"
 ```
 
-## Quick Start
+## クイックスタート
 
 ```rust
 use rustraight::prelude::*;
 
 fn main() {
-    // 1. Configure window
+    // 1. ウィンドウ設定
     let mut window = Window::default();
-    window.title("My Game");
+    window.title("マイゲーム");
     window.size(800, 600);
-    window.screen_size(320, 240); // virtual resolution
+    window.screen_size(320, 240); // 仮想解像度
     window.vsync(true);
     window.init();
 
-    // 2. Load assets
+    // 2. アセット読み込み
     let player = load_graph("player.png");
     let bgm    = load_sound("bgm.ogg");
-    play_sound(bgm, true); // loop
+    play_sound(bgm, true); // ループ再生
 
     let mut x = 0i32;
     let mut y = 0i32;
     let speed = 100.0f32;
 
-    // 3. Main loop
+    // 3. メインループ
     while window.advance_frame() {
         let dt = window.delta_time();
 
@@ -67,118 +68,185 @@ fn main() {
         window.screen_draw_text(0, 0, format!("pos: ({x}, {y})"), Color::WHITE);
     }
 
-    // 4. Free resources
+    // 4. リソース解放
     free_all_sounds();
     free_all_graphs();
 }
 ```
 
-## API Overview
+## API リファレンス
 
-### Window
+### ウィンドウ
 
 ```rust
 let mut window = Window::default();
-window.title("title");
-window.size(800, 600);           // window size in pixels
-window.screen_size(320, 240);    // virtual screen resolution
+window.title("タイトル");
+window.size(800, 600);           // ウィンドウサイズ (ピクセル)
+window.screen_size(320, 240);    // 仮想スクリーン解像度
 window.resizable(true);
 window.vsync(true);
-window.init();                   // open the window
+window.decorations(true);        // タイトルバー等の装飾
+window.transparent(false);       // ウィンドウ背景の透過
+window.init();                   // ウィンドウを開く
 
-window.advance_frame() -> bool   // returns false when the window is closed
-window.delta_time()   -> f32     // seconds since last frame
-window.elapsed_time() -> f64     // seconds since window creation
+window.advance_frame() -> bool   // ウィンドウが閉じられると false を返す
+window.delta_time()   -> f32     // 前フレームからの秒数
+window.elapsed_time() -> f64     // ウィンドウ作成からの秒数
+window.set_position(x, y)        // ウィンドウ位置を設定
+window.position()    -> (i32, i32)
 ```
 
-### Graphics
+### グラフィックス
 
 ```rust
-// Load
-let spr:  u32     = load_graph("image.png");
-let srps: [u32; N] = load_div_graph("sheet.png", N, tile_w, tile_h);
+// 画像の読み込み
+let spr:   u32      = load_graph("image.png");
+let sheet: [u32; N] = load_div_graph("sheet.png", N, tile_w, tile_h);
 free_all_graphs();
 
-// Draw
+// スプライト描画
 window.screen_clear();
 window.screen_draw_sprite(x, y, handle);
 window.screen_draw_sprite_ex(x, y, handle, DrawSpriteParams {
-    scale_x: 2.0, scale_y: 2.0,
-    rotation: 45.0, // degrees
-    alpha: 0.5,
-    flip_x: false, flip_y: false,
+    scale_x:  2.0,
+    scale_y:  2.0,
+    rotation: 45.0, // 度数法
+    alpha:    0.5,  // 0.0 〜 1.0
+    flip_x:   false,
+    flip_y:   false,
     ..Default::default()
 });
 
-// Shapes
-window.screen_draw_fill(Color::BLACK);
-window.screen_draw_rectangle(x, y, w, h, Color::RED, true);
-window.screen_draw_circle(cx, cy, radius, Color::BLUE, false);
-window.screen_draw_line(x1, y1, x2, y2, Color::WHITE);
+// 図形描画
+window.screen_draw_fill(Color::BLACK);                         // 全塗りつぶし
+window.screen_draw_pixel(x, y, Color::WHITE);                  // ピクセル
+window.screen_draw_line(x1, y1, x2, y2, Color::WHITE);        // 線
+window.screen_draw_rectangle(x, y, w, h, Color::RED, true);   // 矩形 (true=塗りつぶし)
+window.screen_draw_circle(cx, cy, radius, Color::BLUE, false); // 円 (false=アウトライン)
 window.screen_draw_triangle(x1,y1, x2,y2, x3,y3, Color::GREEN, true);
 
-// Blend mode
-window.screen_blend_set(BlendMode::Add);
-window.screen_draw_sprite(x, y, glow);
-window.screen_blend_set(BlendMode::Normal);
+// ブレンドモード
+window.screen_blend_set(BlendMode::Add);    // 加算
+window.screen_blend_set(BlendMode::Mul);    // 乗算
+window.screen_blend_set(BlendMode::Normal); // 通常に戻す
 
-// Sub-screen
+// マスク
+window.screen_mask_set(x, y, mask_handle); // スプライトをマスクとして設定
+window.screen_mask_reset();
+```
+
+### サブスクリーン
+
+オフスクリーンのレンダーターゲットをスプライトとして利用できます。
+
+```rust
 let mut screen = window.create_screen(64, 64);
 screen.clear();
 screen.draw_sprite(0, 0, spr);
+screen.draw_rectangle(0, 0, 64, 64, Color::RED, false);
 window.screen_draw_sprite(100, 100, screen.handle());
 ```
 
-### Input
+### 入力
 
 ```rust
-// Keyboard
-window.is_pressed(KeyCode::Space)       // held down
-window.is_just_pressed(KeyCode::Enter)  // pressed this frame
-window.is_released(KeyCode::Escape)     // released this frame
+// キーボード
+window.is_pressed(KeyCode::Space)       // 押している間 true
+window.is_just_pressed(KeyCode::Enter)  // 押した瞬間だけ true
+window.is_released(KeyCode::Escape)     // 離した瞬間だけ true
 
-// Mouse
-window.mouse_position()                 // (x, y) in virtual screen coords
-window.is_mouse_pressed(MouseButton::Left)
-window.is_mouse_just_pressed(MouseButton::Right)
+// マウス
+window.mouse_position()                          // (x, y) 仮想スクリーン座標
+window.is_mouse_pressed(MouseButton::Left)       // 押している間
+window.is_mouse_just_pressed(MouseButton::Right) // 押した瞬間
+window.is_mouse_released(MouseButton::Middle)    // 離した瞬間
 
-// Gamepad
-window.is_pad_pressed(0, PadButton::South)
-window.pad_axis(0, PadAxis::LeftStickX) // -1.0 .. 1.0
+// ゲームパッド
+window.is_pad_pressed(0, PadButton::South)        // pad_id=0
+window.is_pad_just_pressed(0, PadButton::East)
+window.is_pad_released(0, PadButton::West)
+window.pad_axis(0, PadAxis::LeftStickX)           // -1.0 〜 1.0
 window.is_pad_connected(0)
+window.pad_count() -> usize
 ```
 
-### Sound
+### サウンド
 
 ```rust
 let se  = load_sound("jump.wav");
 let bgm = load_sound("bgm.ogg");
 
-play_sound(se,  false); // play once
-play_sound(bgm, true);  // loop
+play_sound(se,  false); // 1 回再生
+play_sound(bgm, true);  // ループ再生
 stop_sound(bgm);
-set_volume(bgm, 0.5);   // 0.0 .. 1.0
+set_volume(bgm, 0.5);   // 音量 0.0 〜 1.0
 free_all_sounds();
 ```
 
-### Text
+対応フォーマット: WAV / OGG Vorbis / MP3 / FLAC
+
+### テキスト
 
 ```rust
-window.font_size(16);             // use system font at size 16
-window.font_file("myfont.ttf");   // or load a custom font file
+window.font_size(16);           // サイズ 16 でシステムフォントを使用
+window.font_file("font.ttf");   // カスタムフォントファイルを指定
 
-window.screen_draw_text(x, y, "Hello!", Color::WHITE);
+window.screen_draw_text(x, y, "こんにちは", Color::WHITE);
 
-// With explicit font handle
-let font = load_font("myfont.ttf", 24);
+// フォントハンドルを直接指定
+let font = load_font("font.ttf", 24);
 window.screen_draw_text_ex(x, y, "Hello!", Color::YELLOW, font);
 let w = get_text_width("Hello!", font);
 ```
 
-## Platform Support
+### オーバーレイウィンドウ (Windows 限定)
 
-rustraight has been tested on Windows. It should work on macOS and Linux (both are supported by wgpu and winit) but has not been verified.
+メインウィンドウの外側を含む全画面に透過描画できるオーバーレイです。OBS 等のウィンドウキャプチャと組み合わせて、ゲーム画面とデスクトップ上の演出を同時に実現できます。
 
-## License
+```rust
+// init() の前に有効化する
+window.overlay_enable(true);
+window.init();
 
-MIT — see [LICENSE](LICENSE)
+// メインループ内
+while window.advance_frame() {
+    window.screen_clear();
+    window.overlay_clear();
+
+    // メインウィンドウへの通常描画
+    window.screen_draw_sprite(x, y, sprite);
+
+    // オーバーレイへの描画 (座標はメインウィンドウ基準、範囲外も描ける)
+    window.overlay_draw_sprite(-50, 100, sprite);    // ウィンドウ枠をはみ出して描画
+    window.overlay_draw_text(-30, 0, "FPS: 300", Color::WHITE);
+    window.overlay_blend_set(BlendMode::Add);
+    window.overlay_draw_sprite_ex(x, y, glow, DrawSpriteParams {
+        alpha: 0.5, ..Default::default()
+    });
+    window.overlay_blend_set(BlendMode::Normal);
+}
+```
+
+`screen_draw_*` でメインウィンドウ外座標に描画すると自動的にオーバーレイへフォールバックします。
+
+| メソッド | 説明 |
+|---|---|
+| `overlay_enable(bool)` | オーバーレイを有効化 (`init()` 前に呼ぶ) |
+| `overlay_visible(bool)` | オーバーレイウィンドウの表示/非表示 |
+| `overlay_clear()` | オーバーレイの描画キューをクリア |
+| `overlay_draw_sprite(x, y, handle)` | スプライトをオーバーレイに描画 |
+| `overlay_draw_sprite_ex(x, y, handle, params)` | 拡張パラメータ付き描画 |
+| `overlay_draw_text(x, y, text, color)` | テキストをオーバーレイに描画 |
+| `overlay_blend_set(BlendMode)` | オーバーレイのブレンドモードを設定 |
+
+## プラットフォーム対応
+
+| OS | メインウィンドウ | オーバーレイ |
+|---|---|---|
+| Windows | ✅ | ✅ |
+| macOS | ✅ (未検証) | ❌ |
+| Linux | ✅ (未検証) | ❌ |
+
+## ライセンス
+
+MIT — [LICENSE](LICENSE) を参照

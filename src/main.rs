@@ -12,9 +12,10 @@ fn main() {
     window.size(WINDOW_WIDTH, WINDOW_HEIGHT);
     window.screen_size(SCREEN_WIDTH, SCREEN_HEIGHT);
     window.resizable(true);
-    window.vsync(true);
+    window.vsync(false);
     window.decorations(true);
     window.transparent(false);
+    window.overlay_enable(true);
 
     // 2. ウィンドウ作成
     window.init();
@@ -50,8 +51,10 @@ fn main() {
 
         // 描画
         window.screen_clear();
+        window.overlay_clear();
         // フレームレート表示
-        window.screen_draw_text(0, 0, format!("fps: {:.2}", frame_rate), Color::WHITE);
+        window.overlay_draw_text(0, 0, format!("fps: {:.2}", frame_rate), Color::WHITE);
+        window.screen_draw_text(0, 20, format!(" dt: {:.3}", dt), Color::WHITE);
     }
 
     // 解放

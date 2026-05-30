@@ -1,6 +1,6 @@
 [package]
 name        = "rustraight"
-version     = "0.1.2"
+version     = "0.2.0"
 edition     = "2024"
 description = "A simple 2D game library for Rust, inspired by DXLib"
 license     = "MIT"
@@ -17,9 +17,20 @@ path = "src/lib.rs"
 name = "rustraight_demo"
 path = "src/main.rs"
 
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+    "Win32_System_LibraryLoader",
+    "Win32_UI_Controls",
+] }
+
 [dependencies]
-wgpu     = "24"
-winit    = "0.30"
+wgpu              = "24"
+raw-window-handle = "0.6"
+winit             = "0.30"
 image    = { version = "0.25", default-features = false, features = ["png"] }
 pollster = "0.4"
 gilrs    = "0.10"
