@@ -63,7 +63,6 @@ fn main() {
         if window.is_pressed(KeyCode::ArrowUp)    { y -= (speed * dt) as i32; }
         if window.is_pressed(KeyCode::ArrowDown)  { y += (speed * dt) as i32; }
 
-        window.screen_clear();
         window.screen_draw_sprite(x, y, player);
         window.screen_draw_text(0, 0, format!("pos: ({x}, {y})"), Color::WHITE);
     }
@@ -105,7 +104,6 @@ let sheet: [u32; N] = load_div_graph("sheet.png", N, tile_w, tile_h);
 free_all_graphs();
 
 // スプライト描画
-window.screen_clear();
 window.screen_draw_sprite(x, y, handle);
 window.screen_draw_sprite_ex(x, y, handle, DrawSpriteParams {
     scale_x:  2.0,
@@ -210,9 +208,6 @@ window.init();
 
 // メインループ内
 while window.advance_frame() {
-    window.screen_clear();
-    window.overlay_clear();
-
     // メインウィンドウへの通常描画
     window.screen_draw_sprite(x, y, sprite);
 
@@ -233,7 +228,7 @@ while window.advance_frame() {
 |---|---|
 | `overlay_enable(bool)` | オーバーレイを有効化 (`init()` 前に呼ぶ) |
 | `overlay_visible(bool)` | オーバーレイウィンドウの表示/非表示 |
-| `overlay_clear()` | オーバーレイの描画キューをクリア |
+| `overlay_clear()` | オーバーレイの描画キューをクリア（フレーム途中でキャンセルしたい場合に使用。毎フレーム末尾に自動クリアされるため通常は不要） |
 | `overlay_draw_sprite(x, y, handle)` | スプライトをオーバーレイに描画 |
 | `overlay_draw_sprite_ex(x, y, handle, params)` | 拡張パラメータ付き描画 |
 | `overlay_draw_text(x, y, text, color)` | テキストをオーバーレイに描画 |
