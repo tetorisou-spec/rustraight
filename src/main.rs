@@ -13,8 +13,8 @@ fn main() {
     window.screen_size(SCREEN_WIDTH, SCREEN_HEIGHT);
     window.resizable(true);
     window.vsync(true);
-    window.decorations(true);
-    window.transparent(false);
+    window.decorations(false);
+    window.transparent(true);
     window.overlay_enable(true);
 
     // 2. ウィンドウ作成

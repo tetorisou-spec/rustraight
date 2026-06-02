@@ -47,21 +47,75 @@ fn missing_sprite() -> SpriteData {
     SpriteData { width: W, height: H, rgba }
 }
 
-fn load_image(path: &str) -> SpriteData {
-    match image::open(path) {
-        Ok(img) => {
-            let rgba = img.to_rgba8();
-            SpriteData {
-                width: rgba.width(),
-                height: rgba.height(),
-                rgba: rgba.into_raw(),
-            }
-        }
-        Err(_) => {
-            eprintln!("[rustraight] load_graph: failed to load '{path}', using missing sprite");
-            missing_sprite()
-        }
+/// WIC (Windows Imaging Component) で画像ファイルを RGBA8 にデコードする。
+/// PNG/JPEG/BMP/TIFF/GIF/WebP など WIC が対応する全フォーマットを読める。
+#[cfg(target_os = "windows")]
+fn load_image_wic(path: &str) -> Option<SpriteData> {
+    use windows::{
+        core::PCWSTR,
+        Win32::Foundation::GENERIC_ACCESS_RIGHTS,
+        Win32::Graphics::Imaging::{
+            CLSID_WICImagingFactory, GUID_WICPixelFormat32bppRGBA,
+            IWICBitmapFrameDecode, IWICFormatConverter, IWICImagingFactory, IWICPalette,
+            WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut,
+            WICDecodeMetadataCacheOnDemand,
+        },
+        Win32::System::Com::{
+            CoCreateInstance, CoInitializeEx, CLSCTX_INPROC_SERVER, COINIT_APARTMENTTHREADED,
+        },
+    };
+    unsafe {
+        // すでに別モードで初期化済みでも WIC オブジェクトはアパートメント非依存なので続行する
+        let _ = CoInitializeEx(None, COINIT_APARTMENTTHREADED);
+
+        let factory: IWICImagingFactory =
+            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+
+        let path_w: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+        let decoder = factory
+            .CreateDecoderFromFilename(
+                PCWSTR(path_w.as_ptr()),
+                None,
+                GENERIC_ACCESS_RIGHTS(0x8000_0000), // GENERIC_READ
+                WICDecodeMetadataCacheOnDemand,
+            )
+            .ok()?;
+
+        let frame: IWICBitmapFrameDecode = decoder.GetFrame(0).ok()?;
+        let mut width = 0u32;
+        let mut height = 0u32;
+        frame.GetSize(&mut width, &mut height).ok()?;
+
+        // RGBA8 フォーマットコンバータを作成
+        let converter: IWICFormatConverter = factory.CreateFormatConverter().ok()?;
+        converter
+            .Initialize(
+                &frame,
+                &GUID_WICPixelFormat32bppRGBA,
+                WICBitmapDitherTypeNone,
+                None::<&IWICPalette>,
+                0.0,
+                WICBitmapPaletteTypeMedianCut,
+            )
+            .ok()?;
+
+        let stride = width * 4;
+        let mut rgba = vec![0u8; (stride * height) as usize];
+        converter
+            .CopyPixels(std::ptr::null(), stride, &mut rgba)
+            .ok()?;
+
+        Some(SpriteData { width, height, rgba })
     }
+}
+
+fn load_image(path: &str) -> SpriteData {
+    #[cfg(target_os = "windows")]
+    if let Some(s) = load_image_wic(path) {
+        return s;
+    }
+    eprintln!("[rustraight] load_graph: failed to load '{path}', using missing sprite");
+    missing_sprite()
 }
 
 pub fn load_graph(path: &str) -> u32 {

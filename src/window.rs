@@ -1,24 +1,193 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::num::NonZeroIsize;
 
-use pollster::block_on;
-use winit::application::ApplicationHandler;
-use winit::dpi::PhysicalPosition;
-use winit::event::{ElementState, MouseButton as WMouseButton, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::PhysicalKey;
-use winit::platform::pump_events::{EventLoopExtPumpEvents, PumpStatus};
-use winit::window::WindowAttributes;
+use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle, RawWindowHandle, RawDisplayHandle};
 
 use crate::draw::{Color, ColorVert, verts_circle, verts_fill, verts_line, verts_pixel, verts_rectangle, verts_triangle};
 use crate::gamepad::{GamepadManager, PadAxis, PadButton};
 use crate::graphics::{BlendMode, DrawSpriteParams};
 use crate::input::{KeyCode, MouseButton};
 
+// ── Win32 イベントバッファ ─────────────────────────────────────────────────────
+
+#[derive(Default)]
+struct Win32Events {
+    should_close:     bool,
+    key_events:       Vec<(u16, bool, bool)>, // (resolved_vk, extended, pressed)
+    resize_event:     Option<(u32, u32)>,
+    cursor_moved:     Option<(i32, i32)>,
+    mouse_btn_events: Vec<(u8, bool)>,
+}
+
+impl Win32Events {
+    fn take_frame(&mut self) -> Self {
+        Self {
+            should_close:     self.should_close, // 一度立ったら保持
+            key_events:       std::mem::take(&mut self.key_events),
+            resize_event:     self.resize_event.take(),
+            cursor_moved:     self.cursor_moved.take(),
+            mouse_btn_events: std::mem::take(&mut self.mouse_btn_events),
+        }
+    }
+}
+
+thread_local! {
+    static WIN32_EVENTS: std::cell::RefCell<Win32Events> =
+        std::cell::RefCell::new(Win32Events::default());
+}
+
+/// メインウィンドウ用 Win32 ウィンドウプロシージャ。
+/// WM_CLOSE を捕捉して should_close を立てる。実際の DestroyWindow は WindowInner::Drop が行う。
+#[cfg(target_os = "windows")]
+unsafe extern "system" fn main_wnd_proc(
+    hwnd:   windows_sys::Win32::Foundation::HWND,
+    msg:    u32,
+    wparam: windows_sys::Win32::Foundation::WPARAM,
+    lparam: windows_sys::Win32::Foundation::LPARAM,
+) -> windows_sys::Win32::Foundation::LRESULT {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    match msg {
+        WM_CLOSE => {
+            WIN32_EVENTS.with(|e| e.borrow_mut().should_close = true);
+            0 // DefWindowProcW を呼ばない → DestroyWindow は WindowInner::Drop に委ねる
+        }
+        WM_SIZE => {
+            let w = (lparam & 0xFFFF) as u32;
+            let h = ((lparam >> 16) & 0xFFFF) as u32;
+            if w > 0 && h > 0 {
+                WIN32_EVENTS.with(|e| e.borrow_mut().resize_event = Some((w, h)));
+            }
+            0
+        }
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let repeat = (lparam >> 30) & 1 == 1;
+            if !repeat {
+                let raw_vk = wparam as u16;
+                let scan   = ((lparam >> 16) & 0xFF) as u16;
+                let ext    = ((lparam >> 24) & 1) != 0;
+                // Shift の L/R 解決: スキャンコード 0x2A=Left 0x36=Right
+                let vk = match raw_vk {
+                    0x10 => if scan == 0x2A { 0xA0u16 } else { 0xA1u16 },
+                    0x11 => if ext { 0xA3u16 } else { 0xA2u16 },
+                    0x12 => if ext { 0xA5u16 } else { 0xA4u16 },
+                    v    => v,
+                };
+                WIN32_EVENTS.with(|e| e.borrow_mut().key_events.push((vk, ext, true)));
+            }
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let raw_vk = wparam as u16;
+            let scan   = ((lparam >> 16) & 0xFF) as u16;
+            let ext    = ((lparam >> 24) & 1) != 0;
+            let vk = match raw_vk {
+                0x10 => if scan == 0x2A { 0xA0u16 } else { 0xA1u16 },
+                0x11 => if ext { 0xA3u16 } else { 0xA2u16 },
+                0x12 => if ext { 0xA5u16 } else { 0xA4u16 },
+                v    => v,
+            };
+            WIN32_EVENTS.with(|e| e.borrow_mut().key_events.push((vk, ext, false)));
+            unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+        }
+        WM_MOUSEMOVE => {
+            let x = (lparam & 0xFFFF) as i16 as i32;
+            let y = ((lparam >> 16) & 0xFFFF) as i16 as i32;
+            WIN32_EVENTS.with(|e| e.borrow_mut().cursor_moved = Some((x, y)));
+            0
+        }
+        WM_LBUTTONDOWN => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((0, true)));  0 }
+        WM_LBUTTONUP   => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((0, false))); 0 }
+        WM_RBUTTONDOWN => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((1, true)));  0 }
+        WM_RBUTTONUP   => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((1, false))); 0 }
+        WM_MBUTTONDOWN => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((2, true)));  0 }
+        WM_MBUTTONUP   => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((2, false))); 0 }
+        _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
+    }
+}
+
+/// メインウィンドウを Win32 で直接生成する。
+#[cfg(target_os = "windows")]
+fn create_main_hwnd(
+    title: &str, w: u32, h: u32,
+    resizable: bool, decorations: bool, transparent: bool,
+) -> isize {
+    use windows_sys::Win32::UI::WindowsAndMessaging::*;
+    use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
+    use windows_sys::Win32::UI::HiDpi::{SetProcessDpiAwarenessContext, DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2};
+    unsafe {
+        // DPI 対応: スケーリングなし (物理ピクセル = 論理ピクセル)
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+        let hinstance  = GetModuleHandleW(std::ptr::null());
+        let class_name: Vec<u16> = "RustraightMain\0".encode_utf16().collect();
+        let wc = WNDCLASSEXW {
+            cbSize:        std::mem::size_of::<WNDCLASSEXW>() as u32,
+            style:         CS_HREDRAW | CS_VREDRAW,
+            lpfnWndProc:   Some(main_wnd_proc),
+            cbClsExtra:    0, cbWndExtra: 0,
+            hInstance:     hinstance,
+            hIcon: 0, hCursor: LoadCursorW(0, IDC_ARROW as *const u16),
+            hbrBackground: 0,
+            lpszMenuName:  std::ptr::null(),
+            lpszClassName: class_name.as_ptr(),
+            hIconSm:       0,
+        };
+        RegisterClassExW(&wc); // 既登録でも続行
+
+        // WS_EX_NOREDIRECTIONBITMAP: DXGI per-pixel alpha に必須
+        // 透過の場合は WS_EX_LAYERED も一時付与して DWM に alpha compositing 対象として登録させる
+        // (winit の動作を再現: LAYERED で作成 → LAYERED 除去 + NOREDIRECTIONBITMAP 維持)
+        let ex_style_final: u32 = if transparent { 0x0020_0000 } else { 0 }; // WS_EX_NOREDIRECTIONBITMAP
+        let ex_style_create: u32 = if transparent { ex_style_final | WS_EX_LAYERED } else { 0 };
+        let style: u32 = if decorations {
+            if resizable { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW & !WS_THICKFRAME }
+        } else {
+            WS_POPUP
+        };
+
+        // クライアント領域が w×h になるよう外枠サイズを調整
+        let mut rect = windows_sys::Win32::Foundation::RECT {
+            left: 0, top: 0, right: w as i32, bottom: h as i32,
+        };
+        AdjustWindowRectEx(&mut rect, style, 0, ex_style_final);
+        let aw = rect.right  - rect.left;
+        let ah = rect.bottom - rect.top;
+
+        let title_w: Vec<u16> = title.encode_utf16().chain(std::iter::once(0)).collect();
+        let hwnd = CreateWindowExW(
+            ex_style_create, class_name.as_ptr(), title_w.as_ptr(),
+            style, CW_USEDEFAULT, CW_USEDEFAULT, aw, ah,
+            0, 0, hinstance, std::ptr::null(),
+        );
+        assert!(hwnd != 0, "CreateWindowExW failed for main window");
+        ShowWindow(hwnd, SW_SHOWDEFAULT);
+
+        // WS_EX_LAYERED はここでは除去しない。
+        // wgpu が caps を返すとき WS_EX_LAYERED を検出して PreMultiplied をサポートに含める。
+        // 実際のパッチ (LAYERED 除去 → NOREDIRECTIONBITMAP 維持) は
+        // surface.get_capabilities() の直後に Window::init() 内で行う。
+
+        hwnd
+    }
+}
+
+/// HWND を所有し Drop 時に DestroyWindow を呼ぶ RAII ラッパー。
+/// WindowInner の最後のフィールドに置き、wgpu Surface より後に破棄させる。
+struct HwndOwner(isize);
+impl Drop for HwndOwner {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            unsafe { windows_sys::Win32::UI::WindowsAndMessaging::DestroyWindow(self.0); }
+        }
+    }
+}
+
 // ── Shaders ───────────────────────────────────────────────────────────────────
 
 // Blits screen_texture (straight alpha) to swap chain as pre-multiplied alpha.
+// Blit for sRGB swap chain: GPU applies gamma automatically; screen_texture has
+// premultiplied-linear RGB from ALPHA_BLENDING, so just pass through.
 const BLIT_SHADER: &str = r#"
 struct Vout { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 @vertex fn vs(@builtin(vertex_index) vi: u32) -> Vout {
@@ -30,7 +199,29 @@ struct Vout { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
 @group(0) @binding(1) var s: sampler;
 @fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
     let c = textureSample(t, s, in.uv);
-    return vec4(c.rgb * c.a, c.a); // straight → pre-multiplied
+    return vec4(c.rgb, c.a);
+}
+"#;
+
+// Blit for Bgra8Unorm swap chain (used when transparent=true): GPU does NOT apply
+// gamma, so we encode to sRGB manually.  Alpha is kept as-is (premultiplied-linear
+// RGB from ALPHA_BLENDING is already the correct premultiplied value).
+const BLIT_SHADER_UNORM: &str = r#"
+struct Vout { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
+@vertex fn vs(@builtin(vertex_index) vi: u32) -> Vout {
+    var p = array<vec2<f32>,6>(vec2(-1.,-1.),vec2(1.,-1.),vec2(-1.,1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,1.));
+    var u = array<vec2<f32>,6>(vec2(0.,1.),vec2(1.,1.),vec2(0.,0.),vec2(1.,1.),vec2(1.,0.),vec2(0.,0.));
+    return Vout(vec4(p[vi],0.,1.), u[vi]);
+}
+@group(0) @binding(0) var t: texture_2d<f32>;
+@group(0) @binding(1) var s: sampler;
+fn lin_to_srgb(x: f32) -> f32 {
+    if x <= 0.0031308 { return x * 12.92; }
+    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
+}
+@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
+    let c = textureSample(t, s, in.uv);
+    return vec4(lin_to_srgb(c.r), lin_to_srgb(c.g), lin_to_srgb(c.b), c.a);
 }
 "#;
 
@@ -161,6 +352,21 @@ pub(crate) struct SpriteVertex {
 
 fn slice_as_bytes<T>(data: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
+}
+
+fn block_on<F: std::future::Future>(f: F) -> F::Output {
+    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
+    const VTABLE: RawWakerVTable = RawWakerVTable::new(
+        |p| RawWaker::new(p, &VTABLE),
+        |_| {}, |_| {}, |_| {},
+    );
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut f = std::pin::pin!(f);
+    loop {
+        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) { return v; }
+        std::hint::spin_loop();
+    }
 }
 
 // ── Overlay (Windows-only) ────────────────────────────────────────────────────
@@ -623,59 +829,9 @@ enum DrawCommand {
     Text   { x: i32, y: i32, width: u32, height: u32, rgba: Vec<u8> },
 }
 
-// ── winit event handler ───────────────────────────────────────────────────────
-
-struct AppHandler {
-    should_close:       bool,
-    key_events:         Vec<(KeyCode, bool)>,
-    resize_event:       Option<(u32, u32)>,
-    cursor_moved:       Option<(f64, f64)>,
-    mouse_btn_events:   Vec<(MouseButton, bool)>,
-    main_window_id:     Option<winit::window::WindowId>,
-}
-
-impl ApplicationHandler for AppHandler {
-    fn resumed(&mut self, _el: &ActiveEventLoop) {}
-
-    fn window_event(&mut self, _el: &ActiveEventLoop, id: winit::window::WindowId, event: WindowEvent) {
-        if self.main_window_id.map(|mid| id != mid).unwrap_or(false) { return; }
-        match event {
-            WindowEvent::CloseRequested => self.should_close = true,
-            WindowEvent::Resized(size) => {
-                self.resize_event = Some((size.width, size.height));
-            }
-            WindowEvent::KeyboardInput { event, .. } => {
-                if let PhysicalKey::Code(code) = event.physical_key {
-                    self.key_events.push((code, event.state == ElementState::Pressed));
-                }
-            }
-            WindowEvent::CursorMoved { position, .. } => {
-                self.cursor_moved = Some((position.x, position.y));
-            }
-            WindowEvent::MouseInput { button, state, .. } => {
-                let btn = match button {
-                    WMouseButton::Left   => Some(MouseButton::Left),
-                    WMouseButton::Right  => Some(MouseButton::Right),
-                    WMouseButton::Middle => Some(MouseButton::Middle),
-                    _                    => None,
-                };
-                if let Some(btn) = btn {
-                    self.mouse_btn_events.push((btn, state == ElementState::Pressed));
-                }
-            }
-            _ => {}
-        }
-    }
-
-    fn about_to_wait(&mut self, _el: &ActiveEventLoop) {}
-}
-
 // ── Runtime state ─────────────────────────────────────────────────────────────
 
 struct WindowInner {
-    winit_window:        Arc<winit::window::Window>,
-    event_loop:          EventLoop<()>,
-    app_handler:         AppHandler,
     device:              wgpu::Device,
     queue:               wgpu::Queue,
     surface:             wgpu::Surface<'static>,
@@ -710,11 +866,14 @@ struct WindowInner {
     transparent:         bool,
     gamepad:             Option<GamepadManager>,
     default_font:        Option<u32>,
+    pending_resize:      Option<(u32, u32)>,
     // Overlay
     #[cfg(target_os = "windows")]
     overlay:             Option<Box<OverlayInner>>,
     overlay_draw_queue:  Vec<DrawCommand>,
     overlay_blend:       BlendMode,
+    // LAST フィールド: Surface より後に drop されるよう末尾に置く
+    hwnd:                HwndOwner,
 }
 
 // ── Public Window struct ──────────────────────────────────────────────────────
@@ -767,28 +926,60 @@ impl Window {
     pub fn transparent(&mut self, v: bool)       { self.transparent = v; }
 
     pub fn init(&mut self) {
-        let event_loop = EventLoop::new().expect("failed to create event loop");
-
-        let win_attrs = WindowAttributes::default()
-            .with_title(&self.title)
-            .with_inner_size(winit::dpi::PhysicalSize::new(self.win_width as u32, self.win_height as u32))
-            .with_resizable(self.resizable)
-            .with_decorations(self.decorations)
-            .with_transparent(self.transparent);
-
-        #[allow(deprecated)]
-        let winit_window = Arc::new(
-            event_loop.create_window(win_attrs).expect("failed to create window"),
+        // Win32 でメインウィンドウを直接生成
+        #[cfg(target_os = "windows")]
+        let hwnd = create_main_hwnd(
+            &self.title,
+            self.win_width  as u32,
+            self.win_height as u32,
+            self.resizable,
+            self.decorations,
+            self.transparent,
         );
+        #[cfg(not(target_os = "windows"))]
+        let hwnd = 0isize; // stub
 
-        // DX12 is required on Windows for PreMultiplied alpha mode (transparent overlay).
-        // Vulkan on Windows only reports Opaque/Inherit, which cannot do per-pixel transparency.
+        // wgpu サーフェスを raw HWND から作成
+        let hinstance = unsafe {
+            windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
+        };
+
+        // DX12 は PreMultiplied alpha (透過ウィンドウ) に必須
         #[cfg(target_os = "windows")]
         let backends = wgpu::Backends::DX12;
         #[cfg(not(target_os = "windows"))]
         let backends = wgpu::Backends::all();
-        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor { backends, ..Default::default() });
-        let surface  = instance.create_surface(winit_window.clone()).expect("failed to create surface");
+
+        // 透過ウィンドウ: wgpu 27 では DxgiFromVisual (DirectComposition) 経由でのみ
+        // PreMultiplied alpha mode が使える。Dx12SwapchainKind は wgpu 27 から公開されて
+        // いないため、from_env_or_default() が読む環境変数で指定する。
+        #[cfg(target_os = "windows")]
+        if self.transparent {
+            // SAFETY: wgpu インスタンス生成前・シングルスレッドのみ
+            unsafe { std::env::set_var("WGPU_DX12_PRESENTATION_SYSTEM", "visual"); }
+        }
+
+        let instance = wgpu::Instance::new(&wgpu::InstanceDescriptor {
+            backends,
+            backend_options: wgpu::BackendOptions {
+                dx12: wgpu::Dx12BackendOptions::from_env_or_default(),
+                ..Default::default()
+            },
+            ..Default::default()
+        });
+
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::RawHandle {
+                raw_display_handle: RawDisplayHandle::Windows(WindowsDisplayHandle::new()),
+                raw_window_handle:  RawWindowHandle::Win32({
+                    let mut h = Win32WindowHandle::new(
+                        NonZeroIsize::new(hwnd as isize).expect("valid hwnd")
+                    );
+                    h.hinstance = NonZeroIsize::new(hinstance as isize);
+                    h
+                }),
+            })
+        }.expect("failed to create surface");
 
         let adapter = block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             compatible_surface: Some(&surface),
@@ -797,16 +988,51 @@ impl Window {
         })).expect("no suitable GPU adapter");
 
         let (device, queue) = block_on(adapter.request_device(
-            &wgpu::DeviceDescriptor::default(), None,
+            &wgpu::DeviceDescriptor::default(),
         )).expect("failed to create wgpu device");
 
-        let caps    = surface.get_capabilities(&adapter);
-        let fmt     = caps.formats[0];
+        let caps = surface.get_capabilities(&adapter);
+
+        // 透過ウィンドウ: ここで初めて WS_EX_LAYERED を除去し WS_EX_NOREDIRECTIONBITMAP に切り替える。
+        // wgpu は WS_EX_LAYERED を検出して PreMultiplied を caps に含める → caps 取得後にパッチ。
+        // surface.configure() 時に DXGI は WS_EX_NOREDIRECTIONBITMAP を見て
+        // DXGI_ALPHA_MODE_PREMULTIPLIED のスワップチェーンを作成する。
+        #[cfg(target_os = "windows")]
+        if self.transparent {
+            unsafe {
+                use windows_sys::Win32::UI::WindowsAndMessaging::*;
+                let cur_ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
+                SetWindowLongW(hwnd, GWL_EXSTYLE, cur_ex & !(WS_EX_LAYERED as i32));
+                if self.decorations {
+                    use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
+                    use windows_sys::Win32::UI::Controls::MARGINS;
+                    let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
+                    DwmExtendFrameIntoClientArea(hwnd, &m);
+                }
+            }
+        }
+
+        // For transparent windows, DX12 PreMultiplied alpha mode requires Bgra8Unorm
+        // (the sRGB variant does not reliably support DXGI_ALPHA_MODE_PREMULTIPLIED).
+        let fmt = if self.transparent {
+            caps.formats.iter()
+                .find(|&&f| f == wgpu::TextureFormat::Bgra8Unorm)
+                .copied()
+                .unwrap_or(caps.formats[0])
+        } else {
+            caps.formats[0]
+        };
         let present = if self.vsync_enabled { wgpu::PresentMode::Fifo } else { wgpu::PresentMode::Immediate };
-        let alpha   = if self.transparent {
-            caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
+        let alpha = if self.transparent {
+            let selected = caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
                 .or_else(|| caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PostMultiplied))
-                .copied().unwrap_or(caps.alpha_modes[0])
+                .copied().unwrap_or(caps.alpha_modes[0]);
+            eprintln!("[rustraight] transparent: formats={:?}", caps.formats);
+            eprintln!("[rustraight] transparent: alpha_modes={:?} → selected={:?}", caps.alpha_modes, selected);
+            if selected == wgpu::CompositeAlphaMode::Opaque {
+                eprintln!("[rustraight] WARNING: PreMultiplied/PostMultiplied not available, transparency will not work");
+            }
+            selected
         } else {
             caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::Opaque)
                 .copied().unwrap_or(caps.alpha_modes[0])
@@ -899,8 +1125,9 @@ impl Window {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
             ],
         });
+        let blit_shader_src = if self.transparent { BLIT_SHADER_UNORM } else { BLIT_SHADER };
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("blit"), source: wgpu::ShaderSource::Wgsl(BLIT_SHADER.into()),
+            label: Some("blit"), source: wgpu::ShaderSource::Wgsl(blit_shader_src.into()),
         });
         let blit_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("blit_layout"), bind_group_layouts: &[&blit_bgl], push_constant_ranges: &[],
@@ -1069,30 +1296,15 @@ impl Window {
             mapped_at_creation: false,
         });
 
-        let main_window_id = winit_window.id();
-
         // ── Overlay (Windows-only) ────────────────────────────────────────────
         #[cfg(target_os = "windows")]
         let overlay = if self.overlay_enabled {
-            Some(Box::new(build_overlay(
-                &device,
-                &sprite_bgl,
-                self.overlay_visible,
-            )))
+            Some(Box::new(build_overlay(&device, &sprite_bgl, self.overlay_visible)))
         } else {
             None
         };
 
         self.inner = Some(Box::new(WindowInner {
-            winit_window, event_loop,
-            app_handler: AppHandler {
-                should_close:     false,
-                key_events:       Vec::new(),
-                resize_event:     None,
-                cursor_moved:     None,
-                mouse_btn_events: Vec::new(),
-                main_window_id:   Some(main_window_id),
-            },
             device, queue, surface, surface_config,
             screen_width: sw, screen_height: sh,
             screen_texture, screen_texture_view,
@@ -1109,10 +1321,12 @@ impl Window {
             transparent:     self.transparent,
             gamepad:         GamepadManager::try_new(),
             default_font:    None,
+            pending_resize:  None,
             #[cfg(target_os = "windows")]
             overlay,
             overlay_draw_queue: Vec::new(),
             overlay_blend:      BlendMode::Normal,
+            hwnd: HwndOwner(hwnd),
         }));
     }
 
@@ -1134,8 +1348,8 @@ impl Window {
         crate::input::commit_mouse_input();
         if let Some(gm) = &mut inner.gamepad { gm.commit(); }
 
-        // ② Handle pending resize
-        if let Some((w, h)) = inner.app_handler.resize_event.take() {
+        // ② Handle pending resize (前フレーム ⑩ で積まれたもの)
+        if let Some((w, h)) = inner.pending_resize.take() {
             if w > 0 && h > 0 {
                 inner.surface_config.width  = w;
                 inner.surface_config.height = h;
@@ -1289,7 +1503,7 @@ impl Window {
             Ok(f) => f,
             Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
                 inner.surface.configure(&inner.device, &inner.surface_config);
-                return !inner.app_handler.should_close;
+                return !WIN32_EVENTS.with(|e| e.borrow().should_close);
             }
             Err(e) => { eprintln!("[rustraight] surface error: {e}"); return false; }
         };
@@ -1303,6 +1517,7 @@ impl Window {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &inner.screen_texture_view,
                     resolve_target: None,
+                    depth_slice:    None,
                     ops:            wgpu::Operations {
                         load:  wgpu::LoadOp::Clear(wgpu::Color { r: 0.0, g: 0.0, b: 0.0, a: 0.0 }),
                         store: wgpu::StoreOp::Store,
@@ -1359,6 +1574,7 @@ impl Window {
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view:           &frame_view,
                     resolve_target: None,
+                    depth_slice:    None,
                     ops:            wgpu::Operations { load: wgpu::LoadOp::Clear(clear), store: wgpu::StoreOp::Store },
                 })],
                 depth_stencil_attachment: None,
@@ -1396,7 +1612,17 @@ impl Window {
             ov.prev_overlay_hash = cur_hash;
 
             // Update main_rect uniform (display pixel position + size of main window)
-            let main_pos = inner.winit_window.inner_position().unwrap_or_default();
+            // GetWindowInfo でクライアント領域のスクリーン座標を取得
+            let main_pos = {
+                use windows_sys::Win32::UI::WindowsAndMessaging::{GetWindowInfo, WINDOWINFO};
+                let mut info: WINDOWINFO = unsafe { std::mem::zeroed() };
+                info.cbSize = std::mem::size_of::<WINDOWINFO>() as u32;
+                unsafe { GetWindowInfo(inner.hwnd.0, &mut info); }
+                windows_sys::Win32::Foundation::POINT {
+                    x: info.rcClient.left,
+                    y: info.rcClient.top,
+                }
+            };
             let main_rect: [f32; 4] = [
                 main_pos.x as f32, main_pos.y as f32,
                 inner.surface_config.width as f32, inner.surface_config.height as f32,
@@ -1588,7 +1814,7 @@ impl Window {
                 let mut rpass = ov_enc.begin_render_pass(&wgpu::RenderPassDescriptor {
                     label: Some("overlay"),
                     color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &ov.overlay_view, resolve_target: None,
+                        view: &ov.overlay_view, resolve_target: None, depth_slice: None,
                         ops: wgpu::Operations { load: wgpu::LoadOp::Clear(wgpu::Color { r:0.,g:0.,b:0.,a:0. }), store: wgpu::StoreOp::Store },
                     })],
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
@@ -1662,9 +1888,9 @@ impl Window {
             // staging[cur] が前々フレームの map_async から未解放なら解放する
             // (高FPSでは通常発生しないが、念のため安全処理)
             if ov.staging_pending[cur] {
-                inner.device.poll(wgpu::Maintain::Poll);
+                let _ = inner.device.poll(wgpu::PollType::Poll);
                 if !ov.staging_ready[cur].load(Ordering::Acquire) {
-                    inner.device.poll(wgpu::Maintain::Wait); // 稀: GPU が2フレーム以上遅延
+                    let _ = inner.device.poll(wgpu::PollType::Wait { submission_index: None, timeout: None }); // 稀: GPU が2フレーム以上遅延
                 }
                 ov.staging_bufs[cur].unmap();
                 ov.staging_ready[cur].store(false, Ordering::Release);
@@ -1688,7 +1914,7 @@ impl Window {
                 ov.staging_pending[cur] = true;
             }
 
-            inner.device.poll(wgpu::Maintain::Poll); // 非同期: ブロックしない
+            let _ = inner.device.poll(wgpu::PollType::Poll); // 非同期: ブロックしない
 
             // 前フレームの staging[prev] が ready なら案5: GDI スレッドへ送信（main スレッドはブロックしない）
             if ov.staging_pending[prev] && ov.staging_ready[prev].load(Ordering::Acquire) {
@@ -1724,31 +1950,48 @@ impl Window {
         // ⑨ Clear draw queue
         inner.draw_queue.clear();
 
-        // ⑩ Process winit events
-        let status = inner.event_loop.pump_app_events(Some(Duration::ZERO), &mut inner.app_handler);
-        for (key, pressed) in inner.app_handler.key_events.drain(..) {
-            crate::input::process_key_event(key, pressed);
-        }
-        if let Some((px, py)) = inner.app_handler.cursor_moved.take() {
-            let vx = (px * inner.screen_width  as f64 / inner.surface_config.width  as f64) as i32;
-            let vy = (py * inner.screen_height as f64 / inner.surface_config.height as f64) as i32;
-            crate::input::process_mouse_move(vx, vy);
-        }
-        for (btn, pressed) in inner.app_handler.mouse_btn_events.drain(..) {
-            crate::input::process_mouse_button(btn, pressed);
-        }
-
-        // オーバーレイウィンドウの Win32 メッセージ処理
-        #[cfg(target_os = "windows")]
-        if let Some(ov) = &inner.overlay {
+        // ⑩ Process Win32 messages (main window + overlay)
+        {
             use windows_sys::Win32::UI::WindowsAndMessaging::*;
             let mut msg: MSG = unsafe { std::mem::zeroed() };
+            // メインウィンドウ
             unsafe {
-                while PeekMessageW(&mut msg, ov.hwnd, 0, 0, PM_REMOVE) != 0 {
+                while PeekMessageW(&mut msg, inner.hwnd.0, 0, 0, PM_REMOVE) != 0 {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
             }
+            // オーバーレイウィンドウ
+            #[cfg(target_os = "windows")]
+            if let Some(ov) = &inner.overlay {
+                unsafe {
+                    while PeekMessageW(&mut msg, ov.hwnd, 0, 0, PM_REMOVE) != 0 {
+                        TranslateMessage(&msg);
+                        DispatchMessageW(&msg);
+                    }
+                }
+            }
+        }
+
+        // WIN32_EVENTS を消費してフレームイベントを処理
+        let events = WIN32_EVENTS.with(|e| e.borrow_mut().take_frame());
+
+        for (vk, ext, pressed) in events.key_events {
+            let key = crate::input::vk_to_keycode(vk, ext);
+            crate::input::process_key_event(key, pressed);
+        }
+        if let Some((x, y)) = events.cursor_moved {
+            let vx = (x * inner.screen_width  as i32) / inner.surface_config.width  as i32;
+            let vy = (y * inner.screen_height as i32) / inner.surface_config.height as i32;
+            crate::input::process_mouse_move(vx, vy);
+        }
+        for (btn, pressed) in events.mouse_btn_events {
+            let btn = match btn { 0 => MouseButton::Left, 1 => MouseButton::Right, _ => MouseButton::Middle };
+            crate::input::process_mouse_button(btn, pressed);
+        }
+        // リサイズは次フレームの ② で適用
+        if let Some(sz) = events.resize_event {
+            inner.pending_resize = Some(sz);
         }
 
         // ⑪ Update delta time
@@ -1757,7 +2000,7 @@ impl Window {
         // ⑫ Poll gamepad state
         if let Some(gm) = &mut inner.gamepad { gm.poll(); }
 
-        !matches!(status, PumpStatus::Exit(_)) && !inner.app_handler.should_close
+        !events.should_close
     }
 
     // ── Input ─────────────────────────────────────────────────────────────────
@@ -1847,13 +2090,21 @@ impl Window {
     // ── Window position ───────────────────────────────────────────────────────
 
     pub fn set_position(&self, x: i32, y: i32) {
-        self.inner_ref().winit_window.set_outer_position(PhysicalPosition::new(x, y));
+        let hwnd = self.inner_ref().hwnd.0;
+        unsafe {
+            use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
+            SetWindowPos(hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+        }
     }
 
     pub fn position(&self) -> (i32, i32) {
-        match self.inner_ref().winit_window.outer_position() {
-            Ok(p) => (p.x, p.y),
-            Err(_) => (0, 0),
+        let hwnd = self.inner_ref().hwnd.0;
+        unsafe {
+            use windows_sys::Win32::Foundation::RECT;
+            use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+            let mut r: RECT = std::mem::zeroed();
+            GetWindowRect(hwnd, &mut r);
+            (r.left, r.top)
         }
     }
 

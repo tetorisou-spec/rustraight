@@ -397,6 +397,7 @@ impl Screen {
                         color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                             view:           &gpu.render_view,
                             resolve_target: None,
+                            depth_slice:    None,
                             ops:            wgpu::Operations { load, store: wgpu::StoreOp::Store },
                         })],
                         depth_stencil_attachment: None,

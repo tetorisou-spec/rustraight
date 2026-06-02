@@ -1,8 +1,6 @@
-use std::collections::HashMap;
-use gilrs::{Axis as GAxis, Button as GButton, GamepadId, Gilrs};
-
-const PAD_BUTTON_COUNT: usize = 16;
-const PAD_AXIS_COUNT:   usize = 6;
+const PAD_COUNT:  usize = 4;
+const BTN_COUNT:  usize = 16;
+const AXIS_COUNT: usize = 6;
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum PadButton {
@@ -16,27 +14,6 @@ pub enum PadButton {
 
 impl PadButton {
     fn index(self) -> usize { self as usize }
-
-    fn to_gilrs(self) -> GButton {
-        match self {
-            PadButton::South     => GButton::South,
-            PadButton::East      => GButton::East,
-            PadButton::West      => GButton::West,
-            PadButton::North     => GButton::North,
-            PadButton::LBumper   => GButton::LeftTrigger,
-            PadButton::RBumper   => GButton::RightTrigger,
-            PadButton::LTrigger  => GButton::LeftTrigger2,
-            PadButton::RTrigger  => GButton::RightTrigger2,
-            PadButton::Select    => GButton::Select,
-            PadButton::Start     => GButton::Start,
-            PadButton::LThumb    => GButton::LeftThumb,
-            PadButton::RThumb    => GButton::RightThumb,
-            PadButton::DPadUp    => GButton::DPadUp,
-            PadButton::DPadDown  => GButton::DPadDown,
-            PadButton::DPadLeft  => GButton::DPadLeft,
-            PadButton::DPadRight => GButton::DPadRight,
-        }
-    }
 }
 
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -48,159 +25,115 @@ pub enum PadAxis {
 
 impl PadAxis {
     fn index(self) -> usize { self as usize }
-
-    fn to_gilrs(self) -> GAxis {
-        match self {
-            PadAxis::LeftStickX   => GAxis::LeftStickX,
-            PadAxis::LeftStickY   => GAxis::LeftStickY,
-            PadAxis::RightStickX  => GAxis::RightStickX,
-            PadAxis::RightStickY  => GAxis::RightStickY,
-            PadAxis::LeftTrigger  => GAxis::LeftZ,
-            PadAxis::RightTrigger => GAxis::RightZ,
-        }
-    }
 }
 
 struct PadState {
     connected: bool,
-    previous:  [bool; PAD_BUTTON_COUNT],
-    current:   [bool; PAD_BUTTON_COUNT],
-    axes:      [f32;  PAD_AXIS_COUNT],
+    previous:  [bool; BTN_COUNT],
+    current:   [bool; BTN_COUNT],
+    axes:      [f32;  AXIS_COUNT],
 }
 
 impl PadState {
-    fn new(connected: bool) -> Self {
-        Self {
-            connected,
-            previous: [false; PAD_BUTTON_COUNT],
-            current:  [false; PAD_BUTTON_COUNT],
-            axes:     [0.0;   PAD_AXIS_COUNT],
-        }
+    fn new() -> Self {
+        Self { connected: false, previous: [false; BTN_COUNT], current: [false; BTN_COUNT], axes: [0.0; AXIS_COUNT] }
     }
-
-    fn commit(&mut self) {
-        self.previous = self.current;
-    }
+    fn commit(&mut self) { self.previous = self.current; }
 }
 
 pub struct GamepadManager {
-    gilrs:      Gilrs,
-    pad_order:  Vec<GamepadId>,
-    pad_states: HashMap<GamepadId, PadState>,
+    states: [PadState; PAD_COUNT],
+}
+
+/// XInput でパッド index 番のボタン/軸状態を読み取る。
+/// 接続されていない場合は connected=false を返す。
+#[cfg(target_os = "windows")]
+fn poll_pad(index: u32) -> (bool, [bool; BTN_COUNT], [f32; AXIS_COUNT]) {
+    use windows_sys::Win32::UI::Input::XboxController::*;
+    unsafe {
+        let mut state = std::mem::zeroed::<XINPUT_STATE>();
+        if XInputGetState(index, &mut state) != 0 {
+            return (false, [false; BTN_COUNT], [0.0; AXIS_COUNT]);
+        }
+        let g = state.Gamepad;
+        let w = g.wButtons;
+        let mut btns = [false; BTN_COUNT];
+        btns[PadButton::South     as usize] = w & XINPUT_GAMEPAD_A              != 0;
+        btns[PadButton::East      as usize] = w & XINPUT_GAMEPAD_B              != 0;
+        btns[PadButton::West      as usize] = w & XINPUT_GAMEPAD_X              != 0;
+        btns[PadButton::North     as usize] = w & XINPUT_GAMEPAD_Y              != 0;
+        btns[PadButton::LBumper   as usize] = w & XINPUT_GAMEPAD_LEFT_SHOULDER  != 0;
+        btns[PadButton::RBumper   as usize] = w & XINPUT_GAMEPAD_RIGHT_SHOULDER != 0;
+        btns[PadButton::LTrigger  as usize] = g.bLeftTrigger  > 30;
+        btns[PadButton::RTrigger  as usize] = g.bRightTrigger > 30;
+        btns[PadButton::Select    as usize] = w & XINPUT_GAMEPAD_BACK           != 0;
+        btns[PadButton::Start     as usize] = w & XINPUT_GAMEPAD_START          != 0;
+        btns[PadButton::LThumb    as usize] = w & XINPUT_GAMEPAD_LEFT_THUMB     != 0;
+        btns[PadButton::RThumb    as usize] = w & XINPUT_GAMEPAD_RIGHT_THUMB    != 0;
+        btns[PadButton::DPadUp    as usize] = w & XINPUT_GAMEPAD_DPAD_UP        != 0;
+        btns[PadButton::DPadDown  as usize] = w & XINPUT_GAMEPAD_DPAD_DOWN      != 0;
+        btns[PadButton::DPadLeft  as usize] = w & XINPUT_GAMEPAD_DPAD_LEFT      != 0;
+        btns[PadButton::DPadRight as usize] = w & XINPUT_GAMEPAD_DPAD_RIGHT     != 0;
+
+        let mut axes = [0.0f32; AXIS_COUNT];
+        axes[PadAxis::LeftStickX   as usize] = g.sThumbLX     as f32 / 32767.0;
+        axes[PadAxis::LeftStickY   as usize] = g.sThumbLY     as f32 / 32767.0;
+        axes[PadAxis::RightStickX  as usize] = g.sThumbRX     as f32 / 32767.0;
+        axes[PadAxis::RightStickY  as usize] = g.sThumbRY     as f32 / 32767.0;
+        axes[PadAxis::LeftTrigger  as usize] = g.bLeftTrigger  as f32 / 255.0;
+        axes[PadAxis::RightTrigger as usize] = g.bRightTrigger as f32 / 255.0;
+
+        (true, btns, axes)
+    }
 }
 
 impl GamepadManager {
     pub fn try_new() -> Option<Self> {
-        let gilrs = Gilrs::new().ok()?;
-        let mut pad_order  = Vec::new();
-        let mut pad_states = HashMap::new();
-        for (id, _) in gilrs.gamepads() {
-            pad_order.push(id);
-            pad_states.insert(id, PadState::new(true));
-        }
-        Some(Self { gilrs, pad_order, pad_states })
+        Some(Self { states: std::array::from_fn(|_| PadState::new()) })
     }
 
-    // Call at the start of advance_frame — snapshot current into previous.
     pub fn commit(&mut self) {
-        for state in self.pad_states.values_mut() {
-            state.commit();
-        }
+        for s in &mut self.states { s.commit(); }
     }
 
-    // Call at the end of advance_frame — drain events then read current state.
     pub fn poll(&mut self) {
-        while let Some(event) = self.gilrs.next_event() {
-            let id = event.id;
-            match event.event {
-                gilrs::EventType::Connected => {
-                    if !self.pad_order.contains(&id) {
-                        self.pad_order.push(id);
-                    }
-                    self.pad_states
-                        .entry(id)
-                        .or_insert_with(|| PadState::new(false))
-                        .connected = true;
-                }
-                gilrs::EventType::Disconnected => {
-                    if let Some(state) = self.pad_states.get_mut(&id) {
-                        state.connected = false;
-                        state.current   = [false; PAD_BUTTON_COUNT];
-                        state.axes      = [0.0;   PAD_AXIS_COUNT];
-                    }
-                }
-                _ => {}
-            }
+        #[cfg(target_os = "windows")]
+        for i in 0..PAD_COUNT {
+            let (connected, btns, axes) = poll_pad(i as u32);
+            let s = &mut self.states[i];
+            s.connected = connected;
+            s.current   = if connected { btns } else { [false; BTN_COUNT] };
+            s.axes      = if connected { axes  } else { [0.0;  AXIS_COUNT] };
         }
-
-        const ALL_BUTTONS: [PadButton; PAD_BUTTON_COUNT] = [
-            PadButton::South, PadButton::East, PadButton::West, PadButton::North,
-            PadButton::LBumper, PadButton::RBumper, PadButton::LTrigger, PadButton::RTrigger,
-            PadButton::Select, PadButton::Start, PadButton::LThumb, PadButton::RThumb,
-            PadButton::DPadUp, PadButton::DPadDown, PadButton::DPadLeft, PadButton::DPadRight,
-        ];
-        const ALL_AXES: [PadAxis; PAD_AXIS_COUNT] = [
-            PadAxis::LeftStickX, PadAxis::LeftStickY,
-            PadAxis::RightStickX, PadAxis::RightStickY,
-            PadAxis::LeftTrigger, PadAxis::RightTrigger,
-        ];
-
-        let connected_ids: Vec<GamepadId> = self.pad_states.iter()
-            .filter(|(_, s)| s.connected)
-            .map(|(&id, _)| id)
-            .collect();
-
-        for id in connected_ids {
-            let (current, axes) = {
-                let pad = self.gilrs.gamepad(id);
-                let mut current = [false; PAD_BUTTON_COUNT];
-                let mut axes    = [0.0f32; PAD_AXIS_COUNT];
-                for &btn in &ALL_BUTTONS {
-                    current[btn.index()] = pad.is_pressed(btn.to_gilrs());
-                }
-                for &axis in &ALL_AXES {
-                    axes[axis.index()] = pad.value(axis.to_gilrs());
-                }
-                (current, axes)
-            };
-            if let Some(state) = self.pad_states.get_mut(&id) {
-                state.current = current;
-                state.axes    = axes;
-            }
-        }
-    }
-
-    fn state(&self, pad_id: usize) -> Option<&PadState> {
-        self.pad_order.get(pad_id).and_then(|id| self.pad_states.get(id))
     }
 
     pub fn is_pressed(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.state(pad_id).map(|s| s.connected && s.current[btn.index()]).unwrap_or(false)
+        self.states.get(pad_id).map(|s| s.connected && s.current[btn.index()]).unwrap_or(false)
     }
 
     pub fn is_just_pressed(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.state(pad_id)
+        self.states.get(pad_id)
             .map(|s| s.connected && s.current[btn.index()] && !s.previous[btn.index()])
             .unwrap_or(false)
     }
 
     pub fn is_released(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.state(pad_id)
+        self.states.get(pad_id)
             .map(|s| s.connected && !s.current[btn.index()] && s.previous[btn.index()])
             .unwrap_or(false)
     }
 
     pub fn axis(&self, pad_id: usize, axis: PadAxis) -> f32 {
-        self.state(pad_id)
+        self.states.get(pad_id)
             .map(|s| if s.connected { s.axes[axis.index()] } else { 0.0 })
             .unwrap_or(0.0)
     }
 
     pub fn is_connected(&self, pad_id: usize) -> bool {
-        self.state(pad_id).map(|s| s.connected).unwrap_or(false)
+        self.states.get(pad_id).map(|s| s.connected).unwrap_or(false)
     }
 
     pub fn count(&self) -> usize {
-        self.pad_states.values().filter(|s| s.connected).count()
+        self.states.iter().filter(|s| s.connected).count()
     }
 }

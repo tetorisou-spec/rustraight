@@ -5,22 +5,25 @@
 
 [DXLib](https://dxlib.xsrv.jp/) にインスパイアされた、Rust 向けシンプル 2D ゲームライブラリです。
 
-[wgpu](https://wgpu.rs/) と [winit](https://github.com/rust-windowing/winit) を基盤とし、GPU の低レイヤな知識なしに 2D ゲームを作れる入門者向け API を提供します。
+[wgpu](https://wgpu.rs/) と Win32 API を基盤とし、GPU の低レイヤな知識なしに 2D ゲームを作れる入門者向け API を提供します。
+
+> **Windows 専用ライブラリです。** グラフィックス・入力・サウンドにそれぞれ DX12 / Win32 / XAudio2 を直接使用しているため、Windows 10 以降が動作要件となります。
 
 ## 特徴
 
 - **ウィンドウ & 仮想スクリーン** — ウィンドウサイズに依存しない独立した仮想解像度でゲームロジックを記述
-- **スプライト描画** — PNG 画像の読み込みとスケール / 回転 / アルファ / 反転付き描画
+- **背景透過ウィンドウ** — DX12 DirectComposition + DWM による per-pixel alpha 透過
+- **スプライト描画** — PNG / JPEG / BMP など WIC 対応フォーマットの読み込みとスケール / 回転 / アルファ / 反転付き描画
 - **スプライトシート** — `load_div_graph` でスプライトシートを個別スプライトに分割
 - **図形描画** — ピクセル・線・矩形・円・三角形（塗りつぶし・アウトライン）
 - **ブレンドモード** — 通常 / 加算 / 乗算
 - **サブスクリーン** — オフスクリーンレンダーターゲットをスプライトとして利用
 - **キーボード & マウス入力** — 押している / 押した瞬間 / 離した瞬間を全キー・ボタンで判定
-- **ゲームパッド入力** — ボタンとアナログスティック ([gilrs](https://gitlab.com/gilrs-project/gilrs) 経由)
-- **サウンド** — WAV / OGG / MP3 / FLAC の読み込み・再生 ([rodio](https://github.com/RustAudio/rodio) 経由)
-- **テキスト描画** — システムフォントまたはカスタム TTF/OTF ファイルによる文字描画 ([fontdue](https://github.com/mooman219/fontdue) 経由)
+- **ゲームパッド入力** — ボタンとアナログスティック (XInput)
+- **サウンド** — WAV（PCM 8/16-bit）の読み込み・再生（XAudio2）
+- **テキスト描画** — システムフォントまたはカスタム TTF/OTF ファイルによる文字描画
 - **デルタタイム & 経過時間** — フレームレート非依存の移動処理を標準サポート
-- **オーバーレイウィンドウ** (Windows 限定) — メインウィンドウの外側（全画面）に描画できる透過オーバーレイ
+- **オーバーレイウィンドウ** — メインウィンドウの外側（全画面）に描画できる透過オーバーレイ
 
 ## インストール
 
@@ -28,7 +31,7 @@
 
 ```toml
 [dependencies]
-rustraight = "0.2"
+rustraight = "0.3"
 ```
 
 ## クイックスタート
@@ -47,7 +50,7 @@ fn main() {
 
     // 2. アセット読み込み
     let player = load_graph("player.png");
-    let bgm    = load_sound("bgm.ogg");
+    let bgm    = load_sound("bgm.wav");
     play_sound(bgm, true); // ループ再生
 
     let mut x = 0i32;
@@ -85,7 +88,7 @@ window.screen_size(320, 240);    // 仮想スクリーン解像度
 window.resizable(true);
 window.vsync(true);
 window.decorations(true);        // タイトルバー等の装飾
-window.transparent(false);       // ウィンドウ背景の透過
+window.transparent(false);       // ウィンドウ背景の透過 (DX12 DirectComposition)
 window.init();                   // ウィンドウを開く
 
 window.advance_frame() -> bool   // ウィンドウが閉じられると false を返す
@@ -98,7 +101,7 @@ window.position()    -> (i32, i32)
 ### グラフィックス
 
 ```rust
-// 画像の読み込み
+// 画像の読み込み (WIC 経由: PNG / JPEG / BMP / TIFF / GIF / WebP 等)
 let spr:   u32      = load_graph("image.png");
 let sheet: [u32; N] = load_div_graph("sheet.png", N, tile_w, tile_h);
 free_all_graphs();
@@ -159,7 +162,7 @@ window.is_mouse_pressed(MouseButton::Left)       // 押している間
 window.is_mouse_just_pressed(MouseButton::Right) // 押した瞬間
 window.is_mouse_released(MouseButton::Middle)    // 離した瞬間
 
-// ゲームパッド
+// ゲームパッド (XInput)
 window.is_pad_pressed(0, PadButton::South)        // pad_id=0
 window.is_pad_just_pressed(0, PadButton::East)
 window.is_pad_released(0, PadButton::West)
@@ -170,9 +173,11 @@ window.pad_count() -> usize
 
 ### サウンド
 
+XAudio2 による WAV 再生です。
+
 ```rust
 let se  = load_sound("jump.wav");
-let bgm = load_sound("bgm.ogg");
+let bgm = load_sound("bgm.wav");
 
 play_sound(se,  false); // 1 回再生
 play_sound(bgm, true);  // ループ再生
@@ -181,7 +186,7 @@ set_volume(bgm, 0.5);   // 音量 0.0 〜 1.0
 free_all_sounds();
 ```
 
-対応フォーマット: WAV / OGG Vorbis / MP3 / FLAC
+対応フォーマット: **WAV（PCM 8-bit / 16-bit）**
 
 ### テキスト
 
@@ -197,7 +202,7 @@ window.screen_draw_text_ex(x, y, "Hello!", Color::YELLOW, font);
 let w = get_text_width("Hello!", font);
 ```
 
-### オーバーレイウィンドウ (Windows 限定)
+### オーバーレイウィンドウ
 
 メインウィンドウの外側を含む全画面に透過描画できるオーバーレイです。OBS 等のウィンドウキャプチャと組み合わせて、ゲーム画面とデスクトップ上の演出を同時に実現できます。
 
@@ -228,19 +233,29 @@ while window.advance_frame() {
 |---|---|
 | `overlay_enable(bool)` | オーバーレイを有効化 (`init()` 前に呼ぶ) |
 | `overlay_visible(bool)` | オーバーレイウィンドウの表示/非表示 |
-| `overlay_clear()` | オーバーレイの描画キューをクリア（フレーム途中でキャンセルしたい場合に使用。毎フレーム末尾に自動クリアされるため通常は不要） |
+| `overlay_clear()` | オーバーレイの描画キューをクリア |
 | `overlay_draw_sprite(x, y, handle)` | スプライトをオーバーレイに描画 |
 | `overlay_draw_sprite_ex(x, y, handle, params)` | 拡張パラメータ付き描画 |
 | `overlay_draw_text(x, y, text, color)` | テキストをオーバーレイに描画 |
 | `overlay_blend_set(BlendMode)` | オーバーレイのブレンドモードを設定 |
 
+## 内部実装
+
+| 機能 | 実装 |
+|---|---|
+| グラフィックス | wgpu 27 (DX12) + DirectComposition |
+| 画像読み込み | WIC (Windows Imaging Component) |
+| サウンド | XAudio2 |
+| キーボード / マウス | Win32 メッセージ (WM_KEYDOWN 等) |
+| ゲームパッド | XInput |
+| テキスト描画 | fontdue |
+
 ## プラットフォーム対応
 
-| OS | メインウィンドウ | オーバーレイ |
-|---|---|---|
-| Windows | ✅ | ✅ |
-| macOS | ✅ (未検証) | ❌ |
-| Linux | ✅ (未検証) | ❌ |
+| OS | 対応状況 |
+|---|---|
+| Windows 10 / 11 | ✅ |
+| macOS / Linux | ❌ (Win32 API を直接使用) |
 
 ## ライセンス
 
