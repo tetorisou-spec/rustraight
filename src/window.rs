@@ -395,12 +395,15 @@ struct OverlayInner {
     unmasked_sprite_pip_mul: wgpu::RenderPipeline,
     unmasked_color_pip:      wgpu::RenderPipeline,
     sprite_bgl:            Arc<wgpu::BindGroupLayout>,
+    #[allow(dead_code)]
     rect_bgl:              wgpu::BindGroupLayout,
     main_rect_buf:         wgpu::Buffer,
     rect_bg_sprite:        wgpu::BindGroup,
     rect_bg_color:         wgpu::BindGroup,
     sprite_vbuf:           wgpu::Buffer,
+    #[allow(dead_code)]
     draw_queue:            Vec<DrawCommand>,
+    #[allow(dead_code)]
     blend:                 BlendMode,
     bg_cache:              HashMap<(u32, Option<u32>), Arc<wgpu::BindGroup>>,
     display_w:             u32,
@@ -512,6 +515,7 @@ fn compute_overlay_hash(draw_queue: &[DrawCommand], overlay_queue: &[DrawCommand
 /// 案1: overlay_texture が Bgra8Unorm のため staging データは既に BGRA 順。
 /// 単純な行コピーのみ (BGRA スワップ不要) → debug ビルドでも高速。
 #[cfg(target_os = "windows")]
+#[allow(dead_code)]
 unsafe fn update_layered_window(
     hwnd: isize, gdi_dc_mem: isize, gdi_pv_bits: usize,
     staged_bgra: &[u8], display_w: u32, display_h: u32, bytes_per_row: usize,
@@ -521,7 +525,7 @@ unsafe fn update_layered_window(
     for y in 0..display_h as usize {
         dst[y*row .. (y+1)*row].copy_from_slice(&staged_bgra[y*bytes_per_row .. y*bytes_per_row + row]);
     }
-    gdi_present(hwnd, gdi_dc_mem, display_w, display_h);
+    unsafe { gdi_present(hwnd, gdi_dc_mem, display_w, display_h); }
 }
 
 /// UpdateLayeredWindow の GDI 呼び出し部分を分離 (GDI スレッドから直接呼ぶ用)。
@@ -534,9 +538,11 @@ unsafe fn gdi_present(hwnd: isize, gdi_dc_mem: isize, display_w: u32, display_h:
     let pt_src = POINT { x: 0, y: 0 };
     let pt_dst = POINT { x: 0, y: 0 };
     let sz     = SIZE  { cx: display_w as i32, cy: display_h as i32 };
-    let hdc_screen = GetDC(0);
-    UpdateLayeredWindow(hwnd, hdc_screen, &pt_dst, &sz, gdi_dc_mem, &pt_src, 0, &blend, 2);
-    ReleaseDC(0, hdc_screen);
+    unsafe {
+        let hdc_screen = GetDC(0);
+        UpdateLayeredWindow(hwnd, hdc_screen, &pt_dst, &sz, gdi_dc_mem, &pt_src, 0, &blend, 2);
+        ReleaseDC(0, hdc_screen);
+    }
 }
 
 #[cfg(target_os = "windows")]
@@ -597,7 +603,7 @@ fn build_overlay(
         ReleaseDC(0, hdc_screen);
         // 初期化: 全透明
         std::ptr::write_bytes(pv as *mut u8, 0u8, (dw * dh * 4) as usize);
-        unsafe { gdi_present(hwnd, dc_mem, dw, dh); }
+        gdi_present(hwnd, dc_mem, dw, dh);
         (dc_mem, bmp, pv as usize)
     };
 
@@ -840,6 +846,7 @@ struct WindowInner {
     screen_width:        u32,
     screen_height:       u32,
     // Screen render target (RENDER_ATTACHMENT + TEXTURE_BINDING)
+    #[allow(dead_code)]
     screen_texture:      wgpu::Texture,
     screen_texture_view: wgpu::TextureView,
     // Final blit to swap chain
@@ -854,6 +861,7 @@ struct WindowInner {
     color_pipeline:      std::sync::Arc<wgpu::RenderPipeline>,
     // Shared sampler + dummy 1x1 white texture for unmasked draws
     sampler:             wgpu::Sampler,
+    #[allow(dead_code)]
     dummy_texture:       wgpu::Texture,
     dummy_view:          wgpu::TextureView,
     // Pre-allocated sprite vertex buffer
@@ -1032,10 +1040,10 @@ impl Window {
             let selected = caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
                 .or_else(|| caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PostMultiplied))
                 .copied().unwrap_or(caps.alpha_modes[0]);
-            eprintln!("[rustraight] transparent: formats={:?}", caps.formats);
-            eprintln!("[rustraight] transparent: alpha_modes={:?} → selected={:?}", caps.alpha_modes, selected);
+            crate::log_info!("透過: フォーマット一覧 = {:?}", caps.formats);
+            crate::log_info!("透過: アルファモード一覧 = {:?}、選択 = {:?}", caps.alpha_modes, selected);
             if selected == wgpu::CompositeAlphaMode::Opaque {
-                eprintln!("[rustraight] WARNING: PreMultiplied/PostMultiplied not available, transparency will not work");
+                crate::log_warn!("PreMultiplied/PostMultiplied が使用できません、透過は機能しません");
             }
             selected
         } else {
@@ -1510,7 +1518,7 @@ impl Window {
                 inner.surface.configure(&inner.device, &inner.surface_config);
                 return !WIN32_EVENTS.with(|e| e.borrow().should_close);
             }
-            Err(e) => { eprintln!("[rustraight] surface error: {e}"); return false; }
+            Err(e) => { crate::log_error!("サーフェスエラー: {e}"); return false; }
         };
         let frame_view = frame.texture.create_view(&Default::default());
         let mut encoder = inner.device.create_command_encoder(&wgpu::CommandEncoderDescriptor::default());
@@ -1824,7 +1832,7 @@ impl Window {
                     })],
                     depth_stencil_attachment: None, timestamp_writes: None, occlusion_query_set: None,
                 });
-                let mut unmasked_text_idx = 0usize;
+                let _unmasked_text_idx = 0usize;
                 for item in &ov_items {
                     match item {
                         OvItem::MaskedSprite { base, handle, mask_handle, blend } => {

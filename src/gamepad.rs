@@ -297,6 +297,7 @@ const DIPROP_RANGE_PTR: *const windows::core::GUID = 4 as *const windows::core::
 /// DirectInput から読み取るジョイスティック状態 (DIJOYSTATE 相当、80 バイト)。
 #[repr(C)]
 #[cfg(target_os = "windows")]
+#[allow(non_snake_case)]
 struct JoyState {
     lX:         i32,
     lY:         i32,
@@ -351,7 +352,7 @@ unsafe fn init_dinput_mgr(hwnd: isize) -> Option<DInputMgr> {
         )
     };
     if hr.is_err() || punk.is_null() {
-        eprintln!("[rustraight] DirectInput8Create failed: {hr:?}");
+        crate::log_error!("DirectInput8Create に失敗しました: {hr:?}");
         return None;
     }
     let dinput: IDirectInput8W = unsafe { std::mem::transmute(punk) };
@@ -396,10 +397,10 @@ unsafe fn reenum_dinput(mgr: &mut DInputMgr) {
         let hwnd_w = HWND(mgr.hwnd as *mut _);
         match unsafe { create_dinput_dev(&mgr.dinput, inst, hwnd_w) } {
             Ok(dev) => {
-                eprintln!("[rustraight] DirectInput device connected: {}", dev.name);
+                crate::log_info!("ゲームパッドを認識しました: {}", dev.name);
                 mgr.devices.push(dev);
             }
-            Err(e) => eprintln!("[rustraight] DInput create failed: {e:?}"),
+            Err(e) => crate::log_warn!("ゲームパッドデバイスの作成に失敗しました: {e:?}"),
         }
     }
 }

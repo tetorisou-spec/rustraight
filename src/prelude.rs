@@ -1,3 +1,4 @@
+pub use crate::{log_info, log_warn, log_error};
 pub use crate::draw::Color;
 pub use crate::gamepad::{PadAxis, PadButton};
 pub use crate::graphics::{BlendMode, DrawSpriteParams, free_all_graphs, load_div_graph, load_graph};

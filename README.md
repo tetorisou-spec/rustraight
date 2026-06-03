@@ -19,11 +19,12 @@
 - **ブレンドモード** — 通常 / 加算 / 乗算
 - **サブスクリーン** — オフスクリーンレンダーターゲットをスプライトとして利用
 - **キーボード & マウス入力** — 押している / 押した瞬間 / 離した瞬間を全キー・ボタンで判定
-- **ゲームパッド入力** — ボタンとアナログスティック (XInput)
-- **サウンド** — WAV（PCM 8/16-bit）の読み込み・再生（XAudio2）
+- **ゲームパッド入力** — ボタンとアナログスティック (DirectInput / XInput)
+- **サウンド** — WAV（PCM 8/16-bit）・OGG Vorbis の読み込み・再生（XAudio2）
 - **テキスト描画** — システムフォントまたはカスタム TTF/OTF ファイルによる文字描画
 - **デルタタイム & 経過時間** — フレームレート非依存の移動処理を標準サポート
 - **オーバーレイウィンドウ** — メインウィンドウの外側（全画面）に描画できる透過オーバーレイ
+- **デバッグログ** — デバッグビルド時のみコンソールに出力されるログマクロ
 
 ## インストール
 
@@ -89,6 +90,7 @@ window.resizable(true);
 window.vsync(true);
 window.decorations(true);        // タイトルバー等の装飾
 window.transparent(false);       // ウィンドウ背景の透過 (DX12 DirectComposition)
+window.topmost(false);           // 常に最前面に表示
 window.init();                   // ウィンドウを開く
 
 window.advance_frame() -> bool   // ウィンドウが閉じられると false を返す
@@ -186,7 +188,7 @@ set_volume(bgm, 0.5);   // 音量 0.0 〜 1.0
 free_all_sounds();
 ```
 
-対応フォーマット: **WAV（PCM 8-bit / 16-bit）**
+対応フォーマット: **WAV（PCM 8-bit / 16-bit）**、**OGG Vorbis**
 
 ### テキスト
 
@@ -238,6 +240,24 @@ while window.advance_frame() {
 | `overlay_draw_sprite_ex(x, y, handle, params)` | 拡張パラメータ付き描画 |
 | `overlay_draw_text(x, y, text, color)` | テキストをオーバーレイに描画 |
 | `overlay_blend_set(BlendMode)` | オーバーレイのブレンドモードを設定 |
+
+### デバッグログ
+
+デバッグビルド (`cargo run` / `cargo build`) のみ標準エラーに出力されるログマクロです。リリースビルド (`cargo build --release`) では出力コードが完全に除去されます。
+
+```rust
+log_info!("スプライトをロードしました: '{}'", path);  // [情報] スプライトをロードしました: 'player.png'
+log_warn!("フォントが見つかりません: '{}'", path);     // [警告] フォントが見つかりません: 'font.ttf'
+log_error!("初期化に失敗しました: {}", reason);        // [エラー] 初期化に失敗しました: ...
+```
+
+ライブラリ内部のイベント（ファイル読み込みエラー・デバイス接続など）もこのマクロで出力されます。
+
+| マクロ | 用途 |
+|---|---|
+| `log_info!(...)` | 通常の情報（読み込み完了・デバイス認識など） |
+| `log_warn!(...)` | 警告（ファイルが見つからない・デコード失敗など） |
+| `log_error!(...)` | エラー（致命的な初期化失敗など） |
 
 ## 内部実装
 

@@ -114,7 +114,7 @@ fn load_image(path: &str) -> SpriteData {
     if let Some(s) = load_image_wic(path) {
         return s;
     }
-    eprintln!("[rustraight] load_graph: failed to load '{path}', using missing sprite");
+    crate::log_warn!("画像の読み込みに失敗しました: '{path}'、代替スプライトを使用します");
     missing_sprite()
 }
 

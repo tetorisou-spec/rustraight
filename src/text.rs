@@ -39,11 +39,11 @@ fn insert_font(font: Font, size: f32) -> u32 {
 pub fn load_font(path: &str, size: u32) -> u32 {
     let bytes = match std::fs::read(path) {
         Ok(b)  => b,
-        Err(_) => { eprintln!("[rustraight] load_font: cannot read '{path}'"); return 0; }
+        Err(_) => { crate::log_warn!("フォントファイルを読み込めません: '{path}'"); return 0; }
     };
     let font = match Font::from_bytes(bytes, FontSettings::default()) {
         Ok(f)  => f,
-        Err(e) => { eprintln!("[rustraight] load_font: parse failed: {e}"); return 0; }
+        Err(e) => { crate::log_warn!("フォントのパースに失敗しました: {e}"); return 0; }
     };
     insert_font(font, size as f32)
 }
@@ -76,7 +76,7 @@ pub(crate) fn load_default_font(size: u32) -> u32 {
             }
         }
     }
-    eprintln!("[rustraight] load_default_font: no system font found");
+    crate::log_warn!("システムフォントが見つかりません");
     0
 }
 

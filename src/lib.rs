@@ -1,5 +1,6 @@
 pub mod draw;
 pub mod gamepad;
+pub mod log;
 pub mod graphics;
 pub mod input;
 pub mod prelude;

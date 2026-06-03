@@ -98,7 +98,7 @@ mod backend {
         pub fn load(&mut self, path: &str) -> u32 {
             let bytes = match std::fs::read(path) {
                 Ok(b)  => b,
-                Err(_) => { eprintln!("[rustraight] load_sound: cannot read '{path}'"); return 0; }
+                Err(_) => { crate::log_warn!("サウンドファイルを読み込めません: '{path}'"); return 0; }
             };
             let lower = path.to_ascii_lowercase();
             let result = if lower.ends_with(".ogg") {
@@ -109,9 +109,8 @@ mod backend {
             let (samples, channels, sample_rate) = match result {
                 Some(v) => v,
                 None => {
-                    eprintln!(
-                        "[rustraight] load_sound: cannot decode '{path}' \
-                         (WAV PCM 8/16-bit または OGG Vorbis のみ対応)"
+                    crate::log_warn!(
+                        "サウンドのデコードに失敗しました: '{path}' (WAV PCM 8/16-bit または OGG Vorbis のみ対応)"
                     );
                     return 0;
                 }
