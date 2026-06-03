@@ -1,6 +1,6 @@
 [package]
 name        = "rustraight"
-version     = "0.3.1"
+version     = "0.3.2"
 edition     = "2024"
 description = "A simple 2D game library for Rust, inspired by DXLib"
 license     = "MIT"
@@ -36,6 +36,7 @@ windows = { version = "0.58", features = [
     "Win32_Media_Audio_XAudio2",
     "Win32_Devices_HumanInterfaceDevice",
 ] }
+lewton = "0.10"
 
 [dependencies]
 wgpu              = "27"

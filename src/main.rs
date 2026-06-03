@@ -15,6 +15,7 @@ fn main() {
     window.vsync(true);
     window.decorations(false);
     window.transparent(true);
+    window.topmost(true);
     window.overlay_enable(true);
 
     // 2. ウィンドウ作成

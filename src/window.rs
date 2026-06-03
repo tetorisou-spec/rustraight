@@ -110,7 +110,7 @@ unsafe extern "system" fn main_wnd_proc(
 #[cfg(target_os = "windows")]
 fn create_main_hwnd(
     title: &str, w: u32, h: u32,
-    resizable: bool, decorations: bool, transparent: bool,
+    resizable: bool, decorations: bool, transparent: bool, topmost: bool,
 ) -> isize {
     use windows_sys::Win32::UI::WindowsAndMessaging::*;
     use windows_sys::Win32::System::LibraryLoader::GetModuleHandleW;
@@ -138,8 +138,9 @@ fn create_main_hwnd(
         // WS_EX_NOREDIRECTIONBITMAP: DXGI per-pixel alpha に必須
         // 透過の場合は WS_EX_LAYERED も一時付与して DWM に alpha compositing 対象として登録させる
         // (winit の動作を再現: LAYERED で作成 → LAYERED 除去 + NOREDIRECTIONBITMAP 維持)
-        let ex_style_final: u32 = if transparent { 0x0020_0000 } else { 0 }; // WS_EX_NOREDIRECTIONBITMAP
-        let ex_style_create: u32 = if transparent { ex_style_final | WS_EX_LAYERED } else { 0 };
+        let topmost_flag: u32 = if topmost { WS_EX_TOPMOST } else { 0 };
+        let ex_style_final: u32 = (if transparent { 0x0020_0000 } else { 0 }) | topmost_flag; // WS_EX_NOREDIRECTIONBITMAP
+        let ex_style_create: u32 = if transparent { ex_style_final | WS_EX_LAYERED } else { ex_style_final };
         let style: u32 = if decorations {
             if resizable { WS_OVERLAPPEDWINDOW } else { WS_OVERLAPPEDWINDOW & !WS_THICKFRAME }
         } else {
@@ -888,6 +889,7 @@ pub struct Window {
     vsync_enabled:     bool,
     decorations:       bool,
     transparent:       bool,
+    topmost:           bool,
     default_font_path: Option<String>,
     default_font_size: u32,
     overlay_enabled:   bool,
@@ -907,6 +909,7 @@ impl Default for Window {
             vsync_enabled:     true,
             decorations:       true,
             transparent:       false,
+            topmost:           false,
             default_font_path: None,
             default_font_size: 16,
             overlay_enabled:   false,
@@ -924,6 +927,7 @@ impl Window {
     pub fn vsync(&mut self, v: bool)             { self.vsync_enabled = v; }
     pub fn decorations(&mut self, v: bool)       { self.decorations = v; }
     pub fn transparent(&mut self, v: bool)       { self.transparent = v; }
+    pub fn topmost(&mut self, v: bool)           { self.topmost = v; }
 
     pub fn init(&mut self) {
         // Win32 でメインウィンドウを直接生成
@@ -935,6 +939,7 @@ impl Window {
             self.resizable,
             self.decorations,
             self.transparent,
+            self.topmost,
         );
         #[cfg(not(target_os = "windows"))]
         let hwnd = 0isize; // stub
@@ -1968,6 +1973,10 @@ impl Window {
                     while PeekMessageW(&mut msg, ov.hwnd, 0, 0, PM_REMOVE) != 0 {
                         TranslateMessage(&msg);
                         DispatchMessageW(&msg);
+                    }
+                    // メインウィンドウが topmost の場合も含め、常にオーバーレイを最前面に維持する
+                    if ov.visible {
+                        SetWindowPos(ov.hwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
                     }
                 }
             }

@@ -100,12 +100,18 @@ mod backend {
                 Ok(b)  => b,
                 Err(_) => { eprintln!("[rustraight] load_sound: cannot read '{path}'"); return 0; }
             };
-            let (samples, channels, sample_rate) = match decode_wav(&bytes) {
+            let lower = path.to_ascii_lowercase();
+            let result = if lower.ends_with(".ogg") {
+                decode_ogg(&bytes)
+            } else {
+                decode_wav(&bytes)
+            };
+            let (samples, channels, sample_rate) = match result {
                 Some(v) => v,
                 None => {
                     eprintln!(
                         "[rustraight] load_sound: cannot decode '{path}' \
-                         (WAV PCM 8/16-bit のみ対応)"
+                         (WAV PCM 8/16-bit または OGG Vorbis のみ対応)"
                     );
                     return 0;
                 }
@@ -230,6 +236,24 @@ mod backend {
 
         Some((samples?, channels?, sample_rate?))
     }
+
+    /// OGG Vorbis を i16 インターリーブ PCM サンプル列にデコードする。
+    fn decode_ogg(bytes: &[u8]) -> Option<(Vec<i16>, u16, u32)> {
+        use lewton::inside_ogg::OggStreamReader;
+        let cursor = std::io::Cursor::new(bytes);
+        let mut reader = OggStreamReader::new(cursor).ok()?;
+        let channels    = reader.ident_hdr.audio_channels as u16;
+        let sample_rate = reader.ident_hdr.audio_sample_rate;
+        let mut samples = Vec::<i16>::new();
+        loop {
+            match reader.read_dec_packet_itl() {
+                Ok(Some(pck)) => samples.extend_from_slice(&pck),
+                Ok(None)      => break,
+                Err(_)        => return None,
+            }
+        }
+        Some((samples, channels, sample_rate))
+    }
 }
 
 // ── non-Windows スタブ ────────────────────────────────────────────────────────
@@ -255,7 +279,7 @@ thread_local! {
 
 // ── 公開 API ──────────────────────────────────────────────────────────────────
 
-/// 音声ファイル（WAV PCM 8/16-bit）をロードしてハンドルを返す。失敗時は 0。
+/// 音声ファイル（WAV PCM 8/16-bit または OGG Vorbis）をロードしてハンドルを返す。失敗時は 0。
 pub fn load_sound(path: &str) -> u32 {
     AUDIO.with(|a| {
         let mut a = a.borrow_mut();
