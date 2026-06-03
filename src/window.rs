@@ -1319,7 +1319,7 @@ impl Window {
             mask:            None,
             blend:           BlendMode::Normal,
             transparent:     self.transparent,
-            gamepad:         GamepadManager::try_new(),
+            gamepad:         GamepadManager::try_new(hwnd),
             default_font:    None,
             pending_resize:  None,
             #[cfg(target_os = "windows")]
