@@ -109,7 +109,7 @@ fn load_image_wic(path: &str) -> Option<SpriteData> {
     }
 }
 
-fn load_image(path: &str) -> SpriteData {
+fn decode_image_file(path: &str) -> SpriteData {
     #[cfg(target_os = "windows")]
     if let Some(s) = load_image_wic(path) {
         return s;
@@ -118,13 +118,13 @@ fn load_image(path: &str) -> SpriteData {
     missing_sprite()
 }
 
-pub fn load_graph(path: &str) -> u32 {
-    let data = load_image(path);
+pub fn load_image(path: &str) -> u32 {
+    let data = decode_image_file(path);
     STORE.with(|s| s.borrow_mut().insert(data))
 }
 
-pub fn load_div_graph(path: &str, count: usize, tile_w: u32, tile_h: u32) -> Vec<u32> {
-    let img = load_image(path);
+pub fn load_div_image(path: &str, count: usize, tile_w: u32, tile_h: u32) -> Vec<u32> {
+    let img = decode_image_file(path);
     let cols = img.width / tile_w;
     let rows = img.height / tile_h;
     let total = (cols * rows) as usize;
@@ -154,7 +154,7 @@ pub fn load_div_graph(path: &str, count: usize, tile_w: u32, tile_h: u32) -> Vec
     ids
 }
 
-pub fn free_all_graphs() {
+pub fn free_all_images() {
     STORE.with(|s| s.borrow_mut().clear());
 }
 

@@ -1,5 +1,36 @@
 # Changelog
 
+## [0.4.0] - 2026-06-09
+
+### 破壊的変更
+
+API を DXLib スタイルのグローバル関数に全面移行。0.3.x との互換性はありません。
+
+- **`Window` 構造体を廃止** — すべての操作がグローバル関数になった
+- **初期化**: `Window::default()` + `.init()` → `init(WindowConfig { .. })`
+- **メインループ**: `window.advance_frame()` → `advance_frame()`
+- **描画**: `window.screen_draw_*` → グローバル `draw_*` + 第1引数 `target: u32`（`0` = メインウィンドウ、それ以外 = サブスクリーン）
+- **入力**: `window.is_pressed()` など → グローバル `is_pressed()` など
+- **タイム**: `window.delta_time()` → `delta_time()`
+- **サブスクリーン**: `Screen` 構造体廃止 → `create_screen(w, h) -> u32` がスプライトハンドルを返す。描画は `draw_image(target, ..)` で統一
+- **命名統一**: `load_graph` → `load_image`、`load_div_graph` → `load_div_image`、`free_all_graphs` → `free_all_images`、`screen_draw_sprite` → `draw_image`
+- **オーバーレイ有効化**: `window.overlay_enable(true)` → `WindowConfig { overlay_enabled: true, .. }`
+- **ブレンド・マスク**: `window.screen_blend_set` → `set_blend`、`window.screen_mask_set` → `set_mask`、`window.screen_mask_reset` → `reset_mask`（target 引数なし）
+- **src/screen.rs 削除** — `DrawCommand` に統合
+
+### 追加
+
+- `create_screen(w: u16, h: u16) -> u32` — オフスクリーンレンダーターゲットをスプライトとして作成
+- `clear(target: u32)` — 指定ターゲットの描画キューをクリア（`0` = ウィンドウ）
+- `src/util.rs` — `slice_as_bytes` / `block_on` を共通ユーティリティとして切り出し
+- `src/window/shaders.rs` — WGSL シェーダー定数を分離（window/mod.rs を軽量化）
+
+### 改善
+
+- **テキストキャッシュ** — `draw_text` / `draw_text_ex` の呼び出しごとに GPU テクスチャを生成していた処理を廃止。同一（文字列 + フォント + 色）の組み合わせを `text_cache` に保持し、初出フレームのみ `build_text_bitmap()` + `create_texture()` を実行。240 フレーム未使用のエントリを自動削除（LRU 方式）。テキストが多い場面でのフレームタイムが大幅に改善
+
+---
+
 ## [0.3.3] - 2026-06-03
 
 ### 追加

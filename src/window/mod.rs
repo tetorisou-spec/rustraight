@@ -1,3 +1,5 @@
+mod shaders;
+
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::num::NonZeroIsize;
@@ -7,7 +9,8 @@ use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle, RawWindowHandle
 use crate::draw::{Color, ColorVert, verts_circle, verts_fill, verts_line, verts_pixel, verts_rectangle, verts_triangle};
 use crate::gamepad::{GamepadManager, PadAxis, PadButton};
 use crate::graphics::{BlendMode, DrawSpriteParams};
-use crate::input::{KeyCode, MouseButton};
+use crate::input::MouseButton;
+use crate::util::{slice_as_bytes, block_on};
 
 // ── Win32 イベントバッファ ─────────────────────────────────────────────────────
 
@@ -184,155 +187,10 @@ impl Drop for HwndOwner {
     }
 }
 
-// ── Shaders ───────────────────────────────────────────────────────────────────
-
-// Blits screen_texture (straight alpha) to swap chain as pre-multiplied alpha.
-// Blit for sRGB swap chain: GPU applies gamma automatically; screen_texture has
-// premultiplied-linear RGB from ALPHA_BLENDING, so just pass through.
-const BLIT_SHADER: &str = r#"
-struct Vout { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> Vout {
-    var p = array<vec2<f32>,6>(vec2(-1.,-1.),vec2(1.,-1.),vec2(-1.,1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,1.));
-    var u = array<vec2<f32>,6>(vec2(0.,1.),vec2(1.,1.),vec2(0.,0.),vec2(1.,1.),vec2(1.,0.),vec2(0.,0.));
-    return Vout(vec4(p[vi],0.,1.), u[vi]);
-}
-@group(0) @binding(0) var t: texture_2d<f32>;
-@group(0) @binding(1) var s: sampler;
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    let c = textureSample(t, s, in.uv);
-    return vec4(c.rgb, c.a);
-}
-"#;
-
-// Blit for Bgra8Unorm swap chain (used when transparent=true): GPU does NOT apply
-// gamma, so we encode to sRGB manually.  Alpha is kept as-is (premultiplied-linear
-// RGB from ALPHA_BLENDING is already the correct premultiplied value).
-const BLIT_SHADER_UNORM: &str = r#"
-struct Vout { @builtin(position) pos: vec4<f32>, @location(0) uv: vec2<f32> }
-@vertex fn vs(@builtin(vertex_index) vi: u32) -> Vout {
-    var p = array<vec2<f32>,6>(vec2(-1.,-1.),vec2(1.,-1.),vec2(-1.,1.),vec2(1.,-1.),vec2(1.,1.),vec2(-1.,1.));
-    var u = array<vec2<f32>,6>(vec2(0.,1.),vec2(1.,1.),vec2(0.,0.),vec2(1.,1.),vec2(1.,0.),vec2(0.,0.));
-    return Vout(vec4(p[vi],0.,1.), u[vi]);
-}
-@group(0) @binding(0) var t: texture_2d<f32>;
-@group(0) @binding(1) var s: sampler;
-fn lin_to_srgb(x: f32) -> f32 {
-    if x <= 0.0031308 { return x * 12.92; }
-    return 1.055 * pow(x, 1.0 / 2.4) - 0.055;
-}
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    let c = textureSample(t, s, in.uv);
-    return vec4(lin_to_srgb(c.r), lin_to_srgb(c.g), lin_to_srgb(c.b), c.a);
-}
-"#;
-
-// Renders a textured sprite quad with optional mask modulation and per-vertex alpha.
-const SPRITE_SHADER: &str = r#"
-struct Vin {
-    @location(0) pos:       vec2<f32>,
-    @location(1) uv:        vec2<f32>,
-    @location(2) screen_xy: vec2<f32>,
-    @location(3) mask_ox:   f32,
-    @location(4) mask_oy:   f32,
-    @location(5) mask_w:    f32,
-    @location(6) mask_h:    f32,
-    @location(7) mask_on:   f32,
-    @location(8) alpha:     f32,
-}
-struct Vout {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) uv:        vec2<f32>,
-    @location(1) screen_xy: vec2<f32>,
-    @location(2) mask_ox:   f32,
-    @location(3) mask_oy:   f32,
-    @location(4) mask_w:    f32,
-    @location(5) mask_h:    f32,
-    @location(6) mask_on:   f32,
-    @location(7) alpha:     f32,
-}
-@group(0) @binding(0) var t_sprite: texture_2d<f32>;
-@group(0) @binding(1) var t_mask:   texture_2d<f32>;
-@group(0) @binding(2) var s_samp:   sampler;
-@vertex fn vs(v: Vin) -> Vout {
-    return Vout(vec4(v.pos, 0., 1.), v.uv, v.screen_xy, v.mask_ox, v.mask_oy, v.mask_w, v.mask_h, v.mask_on, v.alpha);
-}
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    var c = textureSample(t_sprite, s_samp, in.uv);
-    if in.mask_on > 0.5 {
-        let mx = (in.screen_xy.x - in.mask_ox) / in.mask_w;
-        let my = (in.screen_xy.y - in.mask_oy) / in.mask_h;
-        if mx >= 0. && mx <= 1. && my >= 0. && my <= 1. {
-            c.a *= textureSample(t_mask, s_samp, vec2(mx, my)).a;
-        } else {
-            c.a = 0.;
-        }
-    }
-    c.a *= in.alpha;
-    return c;
-}
-"#;
-
-// Sprite shader for overlay (screen_draw overflow): discards fragments inside main window rect.
-const MASKED_SPRITE_SHADER: &str = r#"
-struct Vin {
-    @location(0) pos:       vec2<f32>, @location(1) uv:        vec2<f32>,
-    @location(2) screen_xy: vec2<f32>, @location(3) mask_ox:   f32,
-    @location(4) mask_oy:   f32,       @location(5) mask_w:    f32,
-    @location(6) mask_h:    f32,       @location(7) mask_on:   f32,
-    @location(8) alpha:     f32,
-}
-struct Vout {
-    @builtin(position) clip: vec4<f32>,
-    @location(0) uv:        vec2<f32>, @location(1) screen_xy: vec2<f32>,
-    @location(2) mask_ox:   f32,       @location(3) mask_oy:   f32,
-    @location(4) mask_w:    f32,       @location(5) mask_h:    f32,
-    @location(6) mask_on:   f32,       @location(7) alpha:     f32,
-}
-@group(0) @binding(0) var t_sprite: texture_2d<f32>;
-@group(0) @binding(1) var t_mask:   texture_2d<f32>;
-@group(0) @binding(2) var s_samp:   sampler;
-@group(1) @binding(0) var<uniform> main_rect: vec4<f32>; // x,y,w,h in display pixels
-@vertex fn vs(v: Vin) -> Vout {
-    return Vout(vec4(v.pos,0.,1.), v.uv, v.screen_xy, v.mask_ox, v.mask_oy, v.mask_w, v.mask_h, v.mask_on, v.alpha);
-}
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    let p = in.clip.xy;
-    if p.x >= main_rect.x && p.x < main_rect.x + main_rect.z
-    && p.y >= main_rect.y && p.y < main_rect.y + main_rect.w { discard; }
-    var c = textureSample(t_sprite, s_samp, in.uv);
-    if in.mask_on > 0.5 {
-        let mx = (in.screen_xy.x - in.mask_ox) / in.mask_w;
-        let my = (in.screen_xy.y - in.mask_oy) / in.mask_h;
-        if mx >= 0. && mx <= 1. && my >= 0. && my <= 1. {
-            c.a *= textureSample(t_mask, s_samp, vec2(mx, my)).a;
-        } else { c.a = 0.; }
-    }
-    c.a *= in.alpha;
-    return c;
-}
-"#;
-
-// Color geometry shader for overlay: discards fragments inside main window rect.
-const MASKED_COLOR_SHADER: &str = r#"
-struct Vin  { @location(0) pos: vec2<f32>, @location(1) color: vec4<f32> }
-struct Vout { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> }
-@group(0) @binding(0) var<uniform> main_rect: vec4<f32>;
-@vertex fn vs(v: Vin) -> Vout { return Vout(vec4(v.pos, 0., 1.), v.color); }
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    let p = in.clip.xy;
-    if p.x >= main_rect.x && p.x < main_rect.x + main_rect.z
-    && p.y >= main_rect.y && p.y < main_rect.y + main_rect.w { discard; }
-    return in.color;
-}
-"#;
-
-// Renders colored vertex geometry (fill, lines, shapes).
-const COLOR_SHADER: &str = r#"
-struct Vin  { @location(0) pos: vec2<f32>, @location(1) color: vec4<f32> }
-struct Vout { @builtin(position) clip: vec4<f32>, @location(0) color: vec4<f32> }
-@vertex fn vs(v: Vin) -> Vout { return Vout(vec4(v.pos, 0., 1.), v.color); }
-@fragment fn fs(in: Vout) -> @location(0) vec4<f32> { return in.color; }
-"#;
+use shaders::{
+    BLIT_SHADER, BLIT_SHADER_UNORM, SPRITE_SHADER,
+    MASKED_SPRITE_SHADER, MASKED_COLOR_SHADER, COLOR_SHADER,
+};
 
 // ── Vertex types ──────────────────────────────────────────────────────────────
 
@@ -350,25 +208,6 @@ pub(crate) struct SpriteVertex {
     alpha:     f32,
 }
 // stride: 48 bytes
-
-fn slice_as_bytes<T>(data: &[T]) -> &[u8] {
-    unsafe { std::slice::from_raw_parts(data.as_ptr() as *const u8, std::mem::size_of_val(data)) }
-}
-
-fn block_on<F: std::future::Future>(f: F) -> F::Output {
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-    const VTABLE: RawWakerVTable = RawWakerVTable::new(
-        |p| RawWaker::new(p, &VTABLE),
-        |_| {}, |_| {}, |_| {},
-    );
-    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-    let mut cx = Context::from_waker(&waker);
-    let mut f = std::pin::pin!(f);
-    loop {
-        if let Poll::Ready(v) = f.as_mut().poll(&mut cx) { return v; }
-        std::hint::spin_loop();
-    }
-}
 
 // ── Overlay (Windows-only) ────────────────────────────────────────────────────
 
@@ -497,15 +336,15 @@ fn compute_overlay_hash(draw_queue: &[DrawCommand], overlay_queue: &[DrawCommand
         match cmd {
             DrawCommand::Sprite { x, y, handle, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
                 => { feed(*x as u64); feed(*y as u64); feed(*handle as u64); }
-            DrawCommand::Text { x, y, rgba, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
-                => { feed(*x as u64); feed(*y as u64); for c in rgba.chunks(64) { feed(c[0] as u64); } }
+            DrawCommand::Text { x, y, color, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
+                => { feed(*x as u64); feed(*y as u64); feed(color.r as u64); feed(color.g as u64); feed(color.b as u64); feed(color.a as u64); }
             _ => {}
         }
     }
     for cmd in overlay_queue {
         match cmd {
             DrawCommand::Sprite { x, y, handle, .. } => { feed(*x as u64); feed(*y as u64); feed(*handle as u64); }
-            DrawCommand::Text   { x, y, rgba, .. }   => { feed(*x as u64); feed(*y as u64); for c in rgba.chunks(64) { feed(c[0] as u64); } }
+            DrawCommand::Text   { x, y, color, .. }   => { feed(*x as u64); feed(*y as u64); feed(color.r as u64); feed(color.g as u64); feed(color.b as u64); feed(color.a as u64); }
             DrawCommand::Polys  { verts }             => { feed(verts.len() as u64); }
         }
     }
@@ -784,6 +623,14 @@ struct SpriteGpuData {
     gpu_native: bool,
 }
 
+struct TextCacheEntry {
+    _texture:  wgpu::Texture,
+    view:      wgpu::TextureView,
+    width:     u32,
+    height:    u32,
+    last_used: u64,
+}
+
 fn ensure_sprite(
     handle: u32,
     device: &wgpu::Device,
@@ -833,7 +680,7 @@ fn ensure_sprite(
 enum DrawCommand {
     Polys  { verts: Vec<ColorVert> },
     Sprite { x: i32, y: i32, handle: u32, mask_handle: Option<u32>, mask_ox: i32, mask_oy: i32, params: DrawSpriteParams, blend: BlendMode },
-    Text   { x: i32, y: i32, width: u32, height: u32, rgba: Vec<u8> },
+    Text   { x: i32, y: i32, text: String, font: u32, color: Color },
 }
 
 // ── Runtime state ─────────────────────────────────────────────────────────────
@@ -866,15 +713,23 @@ struct WindowInner {
     dummy_view:          wgpu::TextureView,
     // Pre-allocated sprite vertex buffer
     sprite_vbuf:         wgpu::Buffer, // 1024 sprites * 6 verts * 44 bytes
-    // Per-frame draw queue
+    // Per-frame draw queue (target=0: window)
     draw_queue:          Vec<DrawCommand>,
     sprite_cache:        HashMap<u32, SpriteGpuData>,
     sprite_bg_cache:     HashMap<(u32, Option<u32>), Arc<wgpu::BindGroup>>,
     mask:                Option<(i32, i32, u32)>,
     blend:               BlendMode,
+    // Offscreen screen targets
+    screen_textures:     HashMap<u32, (wgpu::Texture, wgpu::TextureView, u32, u32)>,
+    screen_queues:       HashMap<u32, Vec<DrawCommand>>,
+    screen_cleared:      std::collections::HashSet<u32>,
+    text_cache:          HashMap<(String, u32, [u8; 4]), TextCacheEntry>,
+    frame_count:         u64,
     transparent:         bool,
     gamepad:             Option<GamepadManager>,
     default_font:        Option<u32>,
+    default_font_path:   Option<String>,
+    default_font_size:   u32,
     pending_resize:      Option<(u32, u32)>,
     // Overlay
     #[cfg(target_os = "windows")]
@@ -885,90 +740,112 @@ struct WindowInner {
     hwnd:                HwndOwner,
 }
 
-// ── Public Window struct ──────────────────────────────────────────────────────
+// ── WindowConfig ──────────────────────────────────────────────────────────────
 
-pub struct Window {
-    title:             String,
-    win_width:         u16,
-    win_height:        u16,
-    screen_width:      u16,
-    screen_height:     u16,
-    resizable:         bool,
-    vsync_enabled:     bool,
-    decorations:       bool,
-    transparent:       bool,
-    topmost:           bool,
-    default_font_path: Option<String>,
-    default_font_size: u32,
-    overlay_enabled:   bool,
-    overlay_visible:   bool,
-    inner:             Option<Box<WindowInner>>,
+pub struct WindowConfig {
+    pub title:           String,
+    pub width:           u16,
+    pub height:          u16,
+    pub screen_width:    u16,
+    pub screen_height:   u16,
+    pub resizable:       bool,
+    pub vsync:           bool,
+    pub decorations:     bool,
+    pub transparent:     bool,
+    pub topmost:         bool,
+    pub font_path:       Option<String>,
+    pub font_size:       u32,
+    pub overlay_enabled: bool,
+    pub overlay_visible: bool,
 }
 
-impl Default for Window {
+impl Default for WindowConfig {
     fn default() -> Self {
         Self {
-            title:         String::from("Window"),
-            win_width:     800,
-            win_height:    600,
-            screen_width:  800,
-            screen_height: 600,
-            resizable:         true,
-            vsync_enabled:     true,
-            decorations:       true,
-            transparent:       false,
-            topmost:           false,
-            default_font_path: None,
-            default_font_size: 16,
-            overlay_enabled:   false,
-            overlay_visible:   true,
-            inner:             None,
+            title:           String::from("Window"),
+            width:           800,
+            height:          600,
+            screen_width:    800,
+            screen_height:   600,
+            resizable:       true,
+            vsync:           true,
+            decorations:     true,
+            transparent:     false,
+            topmost:         false,
+            font_path:       None,
+            font_size:       16,
+            overlay_enabled: false,
+            overlay_visible: true,
         }
     }
 }
 
-impl Window {
-    pub fn title(&mut self, t: &str)             { self.title = t.to_string(); }
-    pub fn size(&mut self, w: u16, h: u16)       { self.win_width = w; self.win_height = h; }
-    pub fn screen_size(&mut self, w: u16, h: u16){ self.screen_width = w; self.screen_height = h; }
-    pub fn resizable(&mut self, v: bool)         { self.resizable = v; }
-    pub fn vsync(&mut self, v: bool)             { self.vsync_enabled = v; }
-    pub fn decorations(&mut self, v: bool)       { self.decorations = v; }
-    pub fn transparent(&mut self, v: bool)       { self.transparent = v; }
-    pub fn topmost(&mut self, v: bool)           { self.topmost = v; }
+// ── Global window state ───────────────────────────────────────────────────────
 
-    pub fn init(&mut self) {
-        // Win32 でメインウィンドウを直接生成
+thread_local! {
+    static WINDOW: std::cell::RefCell<Option<Box<WindowInner>>> =
+        std::cell::RefCell::new(None);
+}
+
+fn with_inner<R>(f: impl FnOnce(&WindowInner) -> R) -> R {
+    WINDOW.with(|w| {
+        let borrow = w.borrow();
+        let inner = borrow.as_ref().expect("rustraight: init() を先に呼んでください");
+        f(inner)
+    })
+}
+
+fn with_inner_mut<R>(f: impl FnOnce(&mut WindowInner) -> R) -> R {
+    WINDOW.with(|w| {
+        let mut borrow = w.borrow_mut();
+        let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
+        f(inner)
+    })
+}
+
+fn target_size(inner: &WindowInner, target: u32) -> (u32, u32) {
+    if target == 0 {
+        (inner.screen_width, inner.screen_height)
+    } else {
+        inner.screen_textures.get(&target).map(|(_, _, w, h)| (*w, *h)).unwrap_or((1, 1))
+    }
+}
+
+fn push_draw_cmd(inner: &mut WindowInner, target: u32, cmd: DrawCommand) {
+    if target == 0 {
+        inner.draw_queue.push(cmd);
+    } else {
+        inner.screen_queues.entry(target).or_default().push(cmd);
+    }
+}
+
+// ── init ──────────────────────────────────────────────────────────────────────
+
+pub fn init(config: WindowConfig) {
         #[cfg(target_os = "windows")]
         let hwnd = create_main_hwnd(
-            &self.title,
-            self.win_width  as u32,
-            self.win_height as u32,
-            self.resizable,
-            self.decorations,
-            self.transparent,
-            self.topmost,
+            &config.title,
+            config.width  as u32,
+            config.height as u32,
+            config.resizable,
+            config.decorations,
+            config.transparent,
+            config.topmost,
         );
         #[cfg(not(target_os = "windows"))]
-        let hwnd = 0isize; // stub
+        let hwnd = 0isize;
 
-        // wgpu サーフェスを raw HWND から作成
         let hinstance = unsafe {
             windows_sys::Win32::System::LibraryLoader::GetModuleHandleW(std::ptr::null())
         };
 
-        // DX12 は PreMultiplied alpha (透過ウィンドウ) に必須
         #[cfg(target_os = "windows")]
         let backends = wgpu::Backends::DX12;
         #[cfg(not(target_os = "windows"))]
         let backends = wgpu::Backends::all();
 
-        // 透過ウィンドウ: wgpu 27 では DxgiFromVisual (DirectComposition) 経由でのみ
-        // PreMultiplied alpha mode が使える。Dx12SwapchainKind は wgpu 27 から公開されて
-        // いないため、from_env_or_default() が読む環境変数で指定する。
         #[cfg(target_os = "windows")]
-        if self.transparent {
-            // SAFETY: wgpu インスタンス生成前・シングルスレッドのみ
+        if config.transparent {
             unsafe { std::env::set_var("WGPU_DX12_PRESENTATION_SYSTEM", "visual"); }
         }
 
@@ -1006,17 +883,13 @@ impl Window {
 
         let caps = surface.get_capabilities(&adapter);
 
-        // 透過ウィンドウ: ここで初めて WS_EX_LAYERED を除去し WS_EX_NOREDIRECTIONBITMAP に切り替える。
-        // wgpu は WS_EX_LAYERED を検出して PreMultiplied を caps に含める → caps 取得後にパッチ。
-        // surface.configure() 時に DXGI は WS_EX_NOREDIRECTIONBITMAP を見て
-        // DXGI_ALPHA_MODE_PREMULTIPLIED のスワップチェーンを作成する。
         #[cfg(target_os = "windows")]
-        if self.transparent {
+        if config.transparent {
             unsafe {
                 use windows_sys::Win32::UI::WindowsAndMessaging::*;
                 let cur_ex = GetWindowLongW(hwnd, GWL_EXSTYLE);
                 SetWindowLongW(hwnd, GWL_EXSTYLE, cur_ex & !(WS_EX_LAYERED as i32));
-                if self.decorations {
+                if config.decorations {
                     use windows_sys::Win32::Graphics::Dwm::DwmExtendFrameIntoClientArea;
                     use windows_sys::Win32::UI::Controls::MARGINS;
                     let m = MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 };
@@ -1025,9 +898,7 @@ impl Window {
             }
         }
 
-        // For transparent windows, DX12 PreMultiplied alpha mode requires Bgra8Unorm
-        // (the sRGB variant does not reliably support DXGI_ALPHA_MODE_PREMULTIPLIED).
-        let fmt = if self.transparent {
+        let fmt = if config.transparent {
             caps.formats.iter()
                 .find(|&&f| f == wgpu::TextureFormat::Bgra8Unorm)
                 .copied()
@@ -1035,8 +906,8 @@ impl Window {
         } else {
             caps.formats[0]
         };
-        let present = if self.vsync_enabled { wgpu::PresentMode::Fifo } else { wgpu::PresentMode::Immediate };
-        let alpha = if self.transparent {
+        let present = if config.vsync { wgpu::PresentMode::Fifo } else { wgpu::PresentMode::Immediate };
+        let alpha = if config.transparent {
             let selected = caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PreMultiplied)
                 .or_else(|| caps.alpha_modes.iter().find(|&&m| m == wgpu::CompositeAlphaMode::PostMultiplied))
                 .copied().unwrap_or(caps.alpha_modes[0]);
@@ -1052,20 +923,19 @@ impl Window {
         };
 
         let surface_config = wgpu::SurfaceConfiguration {
-            usage:                          wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format:                         fmt,
-            width:                          self.win_width as u32,
-            height:                         self.win_height as u32,
-            present_mode:                   present,
-            alpha_mode:                     alpha,
-            view_formats:                   vec![],
-            desired_maximum_frame_latency:  2,
+            usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format:                        fmt,
+            width:                         config.width  as u32,
+            height:                        config.height as u32,
+            present_mode:                  present,
+            alpha_mode:                    alpha,
+            view_formats:                  vec![],
+            desired_maximum_frame_latency: 2,
         };
         surface.configure(&device, &surface_config);
 
-        // ── Screen render target ──────────────────────────────────────────────
-        let sw = self.screen_width  as u32;
-        let sh = self.screen_height as u32;
+        let sw = config.screen_width  as u32;
+        let sh = config.screen_height as u32;
         let screen_texture = device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("screen"),
             size:            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
@@ -1078,16 +948,14 @@ impl Window {
         });
         let screen_texture_view = screen_texture.create_view(&Default::default());
 
-        // ── Shared sampler ────────────────────────────────────────────────────
         let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            mag_filter:       wgpu::FilterMode::Nearest,
-            min_filter:       wgpu::FilterMode::Nearest,
-            address_mode_u:   wgpu::AddressMode::ClampToEdge,
-            address_mode_v:   wgpu::AddressMode::ClampToEdge,
+            mag_filter:     wgpu::FilterMode::Nearest,
+            min_filter:     wgpu::FilterMode::Nearest,
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
             ..Default::default()
         });
 
-        // ── Dummy 1×1 white texture (used as placeholder mask) ────────────────
         let dummy_texture = device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("dummy"),
             size:            wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
@@ -1108,7 +976,6 @@ impl Window {
         );
         let dummy_view = dummy_texture.create_view(&Default::default());
 
-        // ── Blit pipeline (screen_texture → swap chain) ───────────────────────
         let blit_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label:   Some("blit_bgl"),
             entries: &[
@@ -1138,7 +1005,7 @@ impl Window {
                 wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&sampler) },
             ],
         });
-        let blit_shader_src = if self.transparent { BLIT_SHADER_UNORM } else { BLIT_SHADER };
+        let blit_shader_src = if config.transparent { BLIT_SHADER_UNORM } else { BLIT_SHADER };
         let blit_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("blit"), source: wgpu::ShaderSource::Wgsl(blit_shader_src.into()),
         });
@@ -1161,7 +1028,6 @@ impl Window {
             cache:         None,
         });
 
-        // ── Sprite pipeline ───────────────────────────────────────────────────
         let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label:   Some("sprite_bgl"),
             entries: &[
@@ -1269,8 +1135,6 @@ impl Window {
         let sprite_pipeline_mul = Arc::new(sprite_pipeline_mul);
         let sprite_bgl          = Arc::new(sprite_bgl);
 
-        // ── Color geometry pipeline (fills, lines, shapes) ────────────────────
-        // ColorVert: pos[2] @ offset 0, color[4] @ offset 8 — stride 24 bytes
         let color_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("color"), source: wgpu::ShaderSource::Wgsl(COLOR_SHADER.into()),
         });
@@ -1301,7 +1165,6 @@ impl Window {
             cache:         None,
         }));
 
-        // ── Pre-allocated sprite vertex buffer ────────────────────────────────
         let sprite_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
             label:              Some("sprite_vbuf"),
             size:               1024 * 6 * 48,
@@ -1309,15 +1172,15 @@ impl Window {
             mapped_at_creation: false,
         });
 
-        // ── Overlay (Windows-only) ────────────────────────────────────────────
         #[cfg(target_os = "windows")]
-        let overlay = if self.overlay_enabled {
-            Some(Box::new(build_overlay(&device, &sprite_bgl, self.overlay_visible)))
+        let overlay = if config.overlay_enabled {
+            Some(Box::new(build_overlay(&device, &sprite_bgl, config.overlay_visible)))
         } else {
             None
         };
 
-        self.inner = Some(Box::new(WindowInner {
+        WINDOW.with(|w| {
+        *w.borrow_mut() = Some(Box::new(WindowInner {
             device, queue, surface, surface_config,
             screen_width: sw, screen_height: sh,
             screen_texture, screen_texture_view,
@@ -1331,9 +1194,16 @@ impl Window {
             sprite_bg_cache: HashMap::new(),
             mask:            None,
             blend:           BlendMode::Normal,
-            transparent:     self.transparent,
+            screen_textures: HashMap::new(),
+            screen_queues:   HashMap::new(),
+            screen_cleared:  std::collections::HashSet::new(),
+            text_cache:      HashMap::new(),
+            frame_count:     0,
+            transparent:     config.transparent,
             gamepad:         GamepadManager::try_new(hwnd),
             default_font:    None,
+            default_font_path: config.font_path,
+            default_font_size: config.font_size,
             pending_resize:  None,
             #[cfg(target_os = "windows")]
             overlay,
@@ -1341,25 +1211,21 @@ impl Window {
             overlay_blend:      BlendMode::Normal,
             hwnd: HwndOwner(hwnd),
         }));
-    }
+        });
+}
 
-    fn inner_mut(&mut self) -> &mut WindowInner {
-        self.inner.as_mut().expect("Window not initialized — call window.init() first")
-    }
+// ── advance_frame ─────────────────────────────────────────────────────────────
 
-    fn inner_ref(&self) -> &WindowInner {
-        self.inner.as_ref().expect("Window not initialized — call window.init() first")
-    }
-
-    // ── Per-frame ─────────────────────────────────────────────────────────────
-
-    pub fn advance_frame(&mut self) -> bool {
-        let inner = self.inner_mut();
+pub fn advance_frame() -> bool {
+    WINDOW.with(|w| {
+        let mut borrow = w.borrow_mut();
+        let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
 
         // ① Confirm input from previous frame
         crate::input::commit_input();
         crate::input::commit_mouse_input();
         if let Some(gm) = &mut inner.gamepad { gm.commit(); }
+        inner.frame_count = inner.frame_count.wrapping_add(1);
 
         // ② Handle pending resize (前フレーム ⑩ で積まれたもの)
         if let Some((w, h)) = inner.pending_resize.take() {
@@ -1367,6 +1233,264 @@ impl Window {
                 inner.surface_config.width  = w;
                 inner.surface_config.height = h;
                 inner.surface.configure(&inner.device, &inner.surface_config);
+            }
+        }
+
+        // ②b Render offscreen screen queues to their textures
+        {
+            let cleared_set: std::collections::HashSet<u32> = std::mem::take(&mut inner.screen_cleared);
+            let mut screen_ids: std::collections::HashSet<u32> = cleared_set.clone();
+            for (id, cmds) in &inner.screen_queues {
+                if !cmds.is_empty() { screen_ids.insert(*id); }
+            }
+
+            let screen_work: Vec<(u32, Vec<DrawCommand>, bool)> = screen_ids.iter().map(|&sid| {
+                let cmds = inner.screen_queues.get_mut(&sid).map(|q| std::mem::take(q)).unwrap_or_default();
+                let do_clear = cleared_set.contains(&sid);
+                (sid, cmds, do_clear)
+            }).collect();
+
+            // Upload sprites needed by screen queues
+            for (_, cmds, _) in &screen_work {
+                for cmd in cmds {
+                    if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd {
+                        ensure_sprite(*handle, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                        if let Some(mh) = mask_handle {
+                            ensure_sprite(*mh, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                        }
+                    }
+                }
+            }
+
+            // ②c Populate text cache for all Text commands this frame
+            {
+                let fc = inner.frame_count;
+                let mut text_keys: Vec<(String, u32, [u8; 4])> = Vec::new();
+                for (_, cmds, _) in &screen_work {
+                    for cmd in cmds {
+                        if let DrawCommand::Text { text, font, color, .. } = cmd {
+                            text_keys.push((text.clone(), *font, [color.r, color.g, color.b, color.a]));
+                        }
+                    }
+                }
+                for cmd in &inner.draw_queue {
+                    if let DrawCommand::Text { text, font, color, .. } = cmd {
+                        text_keys.push((text.clone(), *font, [color.r, color.g, color.b, color.a]));
+                    }
+                }
+                #[cfg(target_os = "windows")]
+                for cmd in &inner.overlay_draw_queue {
+                    if let DrawCommand::Text { text, font, color, .. } = cmd {
+                        text_keys.push((text.clone(), *font, [color.r, color.g, color.b, color.a]));
+                    }
+                }
+                text_keys.sort_unstable();
+                text_keys.dedup();
+
+                for k in &text_keys {
+                    if let Some(e) = inner.text_cache.get_mut(k) { e.last_used = fc; }
+                }
+                let new_keys: Vec<_> = text_keys.into_iter().filter(|k| !inner.text_cache.contains_key(k)).collect();
+                for (text, font, cb) in new_keys {
+                    let color = Color { r: cb[0], g: cb[1], b: cb[2], a: cb[3] };
+                    if let Some((w, h, rgba)) = crate::text::build_text_bitmap(&text, color, font) {
+                        let tex = inner.device.create_texture(&wgpu::TextureDescriptor {
+                            label:           None,
+                            size:            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                            mip_level_count: 1, sample_count: 1,
+                            dimension:       wgpu::TextureDimension::D2,
+                            format:          wgpu::TextureFormat::Rgba8UnormSrgb,
+                            usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+                            view_formats:    &[],
+                        });
+                        inner.queue.write_texture(
+                            wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
+                            &rgba,
+                            wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(h) },
+                            wgpu::Extent3d { width: w, height: h, depth_or_array_layers: 1 },
+                        );
+                        let view = tex.create_view(&Default::default());
+                        inner.text_cache.insert((text, font, cb), TextCacheEntry { _texture: tex, view, width: w, height: h, last_used: fc });
+                    }
+                }
+            }
+
+            // Render each screen
+            for (sid, cmds, do_clear) in screen_work {
+                if cmds.is_empty() && !do_clear { continue; }
+                let (scr_w, scr_h) = match inner.screen_textures.get(&sid) {
+                    Some((_, _, w, h)) => (*w, *h),
+                    None => continue,
+                };
+
+                // Build vertex data
+                let mut scn_sprite_verts: Vec<SpriteVertex> = Vec::new();
+                let mut scn_color_verts:  Vec<ColorVert>    = Vec::new();
+                enum ScnItem { Polys { base: u32, count: u32 }, Sprite { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
+                let mut scn_items: Vec<ScnItem> = Vec::new();
+                let mut scn_text_view_ptrs: Vec<*const wgpu::TextureView> = Vec::new();
+
+                for cmd in &cmds {
+                    match cmd {
+                        DrawCommand::Polys { verts } => {
+                            let base  = scn_color_verts.len() as u32;
+                            let count = verts.len() as u32;
+                            scn_color_verts.extend_from_slice(verts);
+                            scn_items.push(ScnItem::Polys { base, count });
+                        }
+                        DrawCommand::Sprite { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
+                            if let Some(gd) = inner.sprite_cache.get(handle) {
+                                let base = scn_sprite_verts.len() as u32;
+                                let (mox, moy, mw, mh, mon) = if let Some(mh) = mask_handle {
+                                    if let Some(md) = inner.sprite_cache.get(mh) {
+                                        (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32)
+                                    } else { (0., 0., 1., 1., 0.) }
+                                } else { (0., 0., 1., 1., 0.) };
+                                scn_sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                                    *x, *y, gd.width, gd.height, scr_w, scr_h,
+                                    mox, moy, mw, mh, mon, params,
+                                ));
+                                scn_items.push(ScnItem::Sprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
+                            }
+                        }
+                        DrawCommand::Text { x, y, text, font, color } => {
+                            let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
+                            if let Some(entry) = inner.text_cache.get(&key) {
+                                let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
+                                let base = scn_sprite_verts.len() as u32;
+                                scn_sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                                    *x, *y, w, h, scr_w, scr_h,
+                                    0., 0., 1., 1., 0., &DrawSpriteParams::default(),
+                                ));
+                                scn_text_view_ptrs.push(vptr);
+                                scn_items.push(ScnItem::Text { base });
+                            }
+                        }
+                    }
+                }
+
+                // Build vertex buffers
+                use wgpu::util::DeviceExt;
+                let scn_sprite_buf = if !scn_sprite_verts.is_empty() {
+                    Some(inner.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label:    Some("scn_svbuf"),
+                        contents: slice_as_bytes(&scn_sprite_verts),
+                        usage:    wgpu::BufferUsages::VERTEX,
+                    }))
+                } else { None };
+                let scn_color_buf = if !scn_color_verts.is_empty() {
+                    Some(inner.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label:    Some("scn_cvbuf"),
+                        contents: slice_as_bytes(&scn_color_verts),
+                        usage:    wgpu::BufferUsages::VERTEX,
+                    }))
+                } else { None };
+
+                // Build sprite bind groups (reuse sprite_bg_cache)
+                let mut scn_sprite_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
+                for item in &scn_items {
+                    if let ScnItem::Sprite { handle, mask_handle, .. } = item {
+                        let key = (*handle, *mask_handle);
+                        if let Some(cached) = inner.sprite_bg_cache.get(&key) {
+                            scn_sprite_bgs.push(Arc::clone(cached));
+                        } else if let Some(gd) = inner.sprite_cache.get(handle) {
+                            let mask_view = mask_handle
+                                .and_then(|mh| inner.sprite_cache.get(&mh))
+                                .map(|md| &md.view)
+                                .unwrap_or(&inner.dummy_view);
+                            let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                                label:   None,
+                                layout:  &inner.sprite_bgl,
+                                entries: &[
+                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gd.view) },
+                                    wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask_view) },
+                                    wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
+                                ],
+                            }));
+                            inner.sprite_bg_cache.insert(key, Arc::clone(&bg));
+                            scn_sprite_bgs.push(bg);
+                        }
+                    }
+                }
+
+                // Build text bind groups from cache
+                let mut scn_text_bgs: Vec<wgpu::BindGroup> = Vec::new();
+                for view_ptr in &scn_text_view_ptrs {
+                    let view = unsafe { &**view_ptr };
+                    scn_text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                        label:   None,
+                        layout:  &inner.sprite_bgl,
+                        entries: &[
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
+                            wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&inner.dummy_view) },
+                            wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
+                        ],
+                    }));
+                }
+
+                // Render pass to screen texture
+                let load = if do_clear {
+                    wgpu::LoadOp::Clear(wgpu::Color { r: 0., g: 0., b: 0., a: 0. })
+                } else {
+                    wgpu::LoadOp::Load
+                };
+                let render_view = match inner.screen_textures.get(&sid) {
+                    Some((_, v, _, _)) => v as *const wgpu::TextureView,
+                    None => continue,
+                };
+                let mut enc = inner.device.create_command_encoder(&Default::default());
+                {
+                    let rview = unsafe { &*render_view };
+                    let mut rpass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("screen_target"),
+                        color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                            view:           rview,
+                            resolve_target: None,
+                            depth_slice:    None,
+                            ops:            wgpu::Operations { load, store: wgpu::StoreOp::Store },
+                        })],
+                        depth_stencil_attachment: None,
+                        timestamp_writes:         None,
+                        occlusion_query_set:      None,
+                    });
+                    let mut spr_idx  = 0usize;
+                    let mut text_idx = 0usize;
+                    for item in &scn_items {
+                        match item {
+                            ScnItem::Polys { base, count } => {
+                                if let Some(buf) = &scn_color_buf {
+                                    rpass.set_pipeline(&inner.color_pipeline);
+                                    rpass.set_vertex_buffer(0, buf.slice(..));
+                                    rpass.draw(*base..*base + count, 0..1);
+                                }
+                            }
+                            ScnItem::Sprite { base, blend, .. } => {
+                                if spr_idx < scn_sprite_bgs.len() {
+                                    let pipeline = match blend {
+                                        BlendMode::Normal => &inner.sprite_pipeline,
+                                        BlendMode::Add    => &inner.sprite_pipeline_add,
+                                        BlendMode::Mul    => &inner.sprite_pipeline_mul,
+                                    };
+                                    rpass.set_pipeline(pipeline);
+                                    rpass.set_bind_group(0, &*scn_sprite_bgs[spr_idx], &[]);
+                                    rpass.set_vertex_buffer(0, scn_sprite_buf.as_ref().unwrap().slice(..));
+                                    rpass.draw(*base..*base + 6, 0..1);
+                                    spr_idx += 1;
+                                }
+                            }
+                            ScnItem::Text { base } => {
+                                if text_idx < scn_text_bgs.len() {
+                                    rpass.set_pipeline(&inner.sprite_pipeline);
+                                    rpass.set_bind_group(0, &scn_text_bgs[text_idx], &[]);
+                                    rpass.set_vertex_buffer(0, scn_sprite_buf.as_ref().unwrap().slice(..));
+                                    rpass.draw(*base..*base + 6, 0..1);
+                                    text_idx += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+                inner.queue.submit(std::iter::once(enc.finish()));
             }
         }
 
@@ -1393,8 +1517,7 @@ impl Window {
 
         enum RItem { Polys { base: u32, count: u32 }, Sprite { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
         let mut items: Vec<RItem> = Vec::new();
-        struct TextItem { width: u32, height: u32, rgba: Vec<u8> }
-        let mut text_items: Vec<TextItem> = Vec::new();
+        let mut text_view_ptrs: Vec<*const wgpu::TextureView> = Vec::new();
 
         for cmd in &inner.draw_queue {
             match cmd {
@@ -1420,15 +1543,19 @@ impl Window {
                         items.push(RItem::Sprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
                     }
                 }
-                DrawCommand::Text { x, y, width, height, rgba } => {
-                    let base = sprite_verts.len() as u32;
-                    sprite_verts.extend_from_slice(&build_sprite_quad_ex(
-                        *x, *y, *width, *height,
-                        inner.screen_width, inner.screen_height,
-                        0.0, 0.0, 1.0, 1.0, 0.0, &DrawSpriteParams::default(),
-                    ));
-                    text_items.push(TextItem { width: *width, height: *height, rgba: rgba.clone() });
-                    items.push(RItem::Text { base });
+                DrawCommand::Text { x, y, text, font, color } => {
+                    let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
+                    if let Some(entry) = inner.text_cache.get(&key) {
+                        let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
+                        let base = sprite_verts.len() as u32;
+                        sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                            *x, *y, w, h,
+                            inner.screen_width, inner.screen_height,
+                            0.0, 0.0, 1.0, 1.0, 0.0, &DrawSpriteParams::default(),
+                        ));
+                        text_view_ptrs.push(vptr);
+                        items.push(RItem::Text { base });
+                    }
                 }
             }
         }
@@ -1477,29 +1604,10 @@ impl Window {
             }
         }
 
-        // ⑤b Text テクスチャを生成（テクスチャ→ビュー→バインドグループの順で2パス）
-        let mut text_temp: Vec<(wgpu::Texture, wgpu::TextureView)> = Vec::new();
-        for ti in &text_items {
-            let tex = inner.device.create_texture(&wgpu::TextureDescriptor {
-                label:           None,
-                size:            wgpu::Extent3d { width: ti.width, height: ti.height, depth_or_array_layers: 1 },
-                mip_level_count: 1, sample_count: 1,
-                dimension:       wgpu::TextureDimension::D2,
-                format:          wgpu::TextureFormat::Rgba8UnormSrgb,
-                usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                view_formats:    &[],
-            });
-            inner.queue.write_texture(
-                wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                &ti.rgba,
-                wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(ti.width * 4), rows_per_image: Some(ti.height) },
-                wgpu::Extent3d { width: ti.width, height: ti.height, depth_or_array_layers: 1 },
-            );
-            let view = tex.create_view(&Default::default());
-            text_temp.push((tex, view));
-        }
+        // ⑤b テキストバインドグループをキャッシュから生成
         let mut text_bgs: Vec<wgpu::BindGroup> = Vec::new();
-        for (_, view) in &text_temp {
+        for view_ptr in &text_view_ptrs {
+            let view = unsafe { &**view_ptr };
             text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label:   None,
                 layout:  &inner.sprite_bgl,
@@ -1702,8 +1810,8 @@ impl Window {
                           UnmaskedColor { base: u32, count: u32 },
                           UnmaskedText  { base: u32, text_idx: usize } }
             let mut ov_items: Vec<OvItem> = Vec::new();
-            // Text items for overlay (both masked screen_draw overflow and unmasked overlay_draw)
-            let mut ov_text_items_all: Vec<(u32, u32, Vec<u8>)> = Vec::new();
+            // Text view pointers for overlay (both masked screen_draw overflow and unmasked overlay_draw)
+            let mut ov_text_view_ptrs: Vec<*const wgpu::TextureView> = Vec::new();
 
             // screen_draw commands → masked
             for cmd in &inner.draw_queue {
@@ -1732,13 +1840,17 @@ impl Window {
                         ov_color_verts.extend_from_slice(&remapped);
                         ov_items.push(OvItem::MaskedColor { base, count });
                     }
-                    DrawCommand::Text { x, y, width, height, rgba } => {
+                    DrawCommand::Text { x, y, text, font, color } => {
                         if *x < 0 || *y < 0 || *x >= sw || *y >= sh {
-                            let base = ov_sprite_verts.len() as u32;
-                            let text_idx = ov_text_items_all.len();
-                            ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, *width, *height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
-                            ov_text_items_all.push((*width, *height, rgba.clone()));
-                            ov_items.push(OvItem::MaskedText { base, text_idx });
+                            let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
+                            if let Some(entry) = inner.text_cache.get(&key) {
+                                let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
+                                let base = ov_sprite_verts.len() as u32;
+                                let text_idx = ov_text_view_ptrs.len();
+                                ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
+                                ov_text_view_ptrs.push(vptr);
+                                ov_items.push(OvItem::MaskedText { base, text_idx });
+                            }
                         }
                     }
                 }
@@ -1770,12 +1882,16 @@ impl Window {
                         ov_color_verts.extend_from_slice(&remapped);
                         ov_items.push(OvItem::UnmaskedColor { base, count });
                     }
-                    DrawCommand::Text { x, y, width, height, rgba } => {
-                        let base = ov_sprite_verts.len() as u32;
-                        let text_idx = ov_text_items_all.len();
-                        ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, *width, *height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
-                        ov_text_items_all.push((*width, *height, rgba.clone()));
-                        ov_items.push(OvItem::UnmaskedText { base, text_idx });
+                    DrawCommand::Text { x, y, text, font, color } => {
+                        let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
+                        if let Some(entry) = inner.text_cache.get(&key) {
+                            let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
+                            let base = ov_sprite_verts.len() as u32;
+                            let text_idx = ov_text_view_ptrs.len();
+                            ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
+                            ov_text_view_ptrs.push(vptr);
+                            ov_items.push(OvItem::UnmaskedText { base, text_idx });
+                        }
                     }
                 }
             }
@@ -1791,26 +1907,10 @@ impl Window {
                 }))
             } else { None };
 
-            // Build GPU textures for all overlay text items (masked screen_draw + unmasked overlay_draw)
-            let mut ov_text_temp: Vec<(wgpu::Texture, wgpu::TextureView)> = Vec::new();
-            for (w, h, rgba) in &ov_text_items_all {
-                let tex = inner.device.create_texture(&wgpu::TextureDescriptor {
-                    label: None, size: wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
-                    mip_level_count: 1, sample_count: 1, dimension: wgpu::TextureDimension::D2,
-                    format: wgpu::TextureFormat::Rgba8UnormSrgb,
-                    usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-                    view_formats: &[],
-                });
-                inner.queue.write_texture(
-                    wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
-                    rgba, wgpu::TexelCopyBufferLayout { offset: 0, bytes_per_row: Some(w * 4), rows_per_image: Some(*h) },
-                    wgpu::Extent3d { width: *w, height: *h, depth_or_array_layers: 1 },
-                );
-                let view = tex.create_view(&Default::default());
-                ov_text_temp.push((tex, view));
-            }
+            // Build overlay text bind groups from cache
             let mut ov_text_bgs: Vec<wgpu::BindGroup> = Vec::new();
-            for (_, view) in &ov_text_temp {
+            for view_ptr in &ov_text_view_ptrs {
+                let view = unsafe { &**view_ptr };
                 ov_text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None, layout: &ov.sprite_bgl,
                     entries: &[
@@ -1962,6 +2062,9 @@ impl Window {
 
         // ⑨ Clear draw queue
         inner.draw_queue.clear();
+        // Evict text cache entries unused for 240+ frames
+        let fc = inner.frame_count;
+        inner.text_cache.retain(|_, v| v.last_used + 240 >= fc);
 
         // ⑩ Process Win32 messages (main window + overlay)
         {
@@ -2018,117 +2121,190 @@ impl Window {
         if let Some(gm) = &mut inner.gamepad { gm.poll(); }
 
         !events.should_close
-    }
+    })
+}
 
-    // ── Input ─────────────────────────────────────────────────────────────────
+// ── Time / input passthrough ──────────────────────────────────────────────────
 
-    pub fn is_pressed(&self, key: KeyCode) -> bool      { crate::input::is_pressed(key) }
-    pub fn is_just_pressed(&self, key: KeyCode) -> bool { crate::input::is_just_pressed(key) }
-    pub fn is_released(&self, key: KeyCode) -> bool     { crate::input::is_released(key) }
-    pub fn delta_time(&self) -> f32                     { crate::time::get_delta_time() }
-    pub fn elapsed_time(&self) -> f64                   { crate::time::get_elapsed_secs() }
+pub fn delta_time()    -> f32  { crate::time::get_delta_time() }
+pub fn elapsed_time()  -> f64  { crate::time::get_elapsed_secs() }
+pub fn mouse_position() -> (i32, i32) { crate::input::mouse_position() }
 
-    // ── Mouse ─────────────────────────────────────────────────────────────────
+// ── Gamepad ───────────────────────────────────────────────────────────────────
 
-    /// マウス座標を仮想スクリーン座標で返す。
-    pub fn mouse_position(&self) -> (i32, i32) { crate::input::mouse_position() }
-    pub fn is_mouse_pressed(&self, btn: MouseButton) -> bool      { crate::input::is_mouse_pressed(btn) }
-    pub fn is_mouse_just_pressed(&self, btn: MouseButton) -> bool { crate::input::is_mouse_just_pressed(btn) }
-    pub fn is_mouse_released(&self, btn: MouseButton) -> bool     { crate::input::is_mouse_released(btn) }
+pub fn is_pad_pressed(pad_id: usize, btn: PadButton) -> bool {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.is_pressed(pad_id, btn)).unwrap_or(false))
+}
+pub fn is_pad_just_pressed(pad_id: usize, btn: PadButton) -> bool {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.is_just_pressed(pad_id, btn)).unwrap_or(false))
+}
+pub fn is_pad_released(pad_id: usize, btn: PadButton) -> bool {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.is_released(pad_id, btn)).unwrap_or(false))
+}
+pub fn pad_axis(pad_id: usize, axis: PadAxis) -> f32 {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.axis(pad_id, axis)).unwrap_or(0.0))
+}
+pub fn is_pad_connected(pad_id: usize) -> bool {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.is_connected(pad_id)).unwrap_or(false))
+}
+pub fn pad_count() -> usize {
+    with_inner(|i| i.gamepad.as_ref().map(|gm| gm.count()).unwrap_or(0))
+}
 
-    // ── Gamepad ───────────────────────────────────────────────────────────────
+// ── Font ──────────────────────────────────────────────────────────────────────
 
-    pub fn is_pad_pressed(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.is_pressed(pad_id, btn)).unwrap_or(false)
-    }
+pub fn set_font_file(path: &str) {
+    with_inner_mut(|inner| {
+        inner.default_font_path = Some(path.to_string());
+        inner.default_font = None;
+    });
+}
+pub fn set_font_size(size: u32) {
+    with_inner_mut(|inner| {
+        inner.default_font_size = size;
+        inner.default_font = None;
+    });
+}
 
-    pub fn is_pad_just_pressed(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.is_just_pressed(pad_id, btn)).unwrap_or(false)
-    }
+fn ensure_default_font() -> u32 {
+    let (path, size, existing) = with_inner(|i| (i.default_font_path.clone(), i.default_font_size, i.default_font));
+    if let Some(id) = existing { return id; }
+    let id = if let Some(p) = path {
+        crate::text::load_font(&p, size)
+    } else {
+        crate::text::load_default_font(size)
+    };
+    if id != 0 { with_inner_mut(|i| i.default_font = Some(id)); }
+    id
+}
 
-    pub fn is_pad_released(&self, pad_id: usize, btn: PadButton) -> bool {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.is_released(pad_id, btn)).unwrap_or(false)
-    }
+// ── Drawing ───────────────────────────────────────────────────────────────────
 
-    pub fn pad_axis(&self, pad_id: usize, axis: PadAxis) -> f32 {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.axis(pad_id, axis)).unwrap_or(0.0)
-    }
-
-    pub fn is_pad_connected(&self, pad_id: usize) -> bool {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.is_connected(pad_id)).unwrap_or(false)
-    }
-
-    pub fn pad_count(&self) -> usize {
-        self.inner_ref().gamepad.as_ref().map(|gm| gm.count()).unwrap_or(0)
-    }
-
-    // ── テキスト ──────────────────────────────────────────────────────────────
-
-    /// デフォルトフォントのファイルを指定する。
-    pub fn font_file(&mut self, path: &str) {
-        self.default_font_path = Some(path.to_string());
-        if let Some(inner) = &mut self.inner { inner.default_font = None; }
-    }
-
-    /// デフォルトフォントのサイズを指定する（ピクセル、デフォルト 16）。
-    pub fn font_size(&mut self, size: u32) {
-        self.default_font_size = size;
-        if let Some(inner) = &mut self.inner { inner.default_font = None; }
-    }
-
-    fn ensure_default_font(&mut self) -> u32 {
-        if self.inner.is_none() { return 0; }
-        if let Some(id) = self.inner.as_ref().unwrap().default_font { return id; }
-        let path = self.default_font_path.clone();
-        let size = self.default_font_size;
-        let id = if let Some(p) = path {
-            crate::text::load_font(&p, size)
+pub fn clear(target: u32) {
+    with_inner_mut(|inner| {
+        if target == 0 {
+            inner.draw_queue.clear();
         } else {
-            crate::text::load_default_font(size)
-        };
-        if id != 0 { self.inner.as_mut().unwrap().default_font = Some(id); }
-        id
-    }
-
-    /// デフォルトフォントでテキストを描画する。
-    pub fn screen_draw_text(&mut self, x: i32, y: i32, text: impl AsRef<str>, color: crate::draw::Color) {
-        let font = self.ensure_default_font();
-        self.screen_draw_text_ex(x, y, text, color, font);
-    }
-
-    /// フォントハンドルを指定してテキストを描画する。
-    pub fn screen_draw_text_ex(&mut self, x: i32, y: i32, text: impl AsRef<str>, color: crate::draw::Color, font: u32) {
-        if font == 0 { return; }
-        if let Some((w, h, rgba)) = crate::text::build_text_bitmap(text.as_ref(), color, font) {
-            self.inner_mut().draw_queue.push(DrawCommand::Text { x, y, width: w, height: h, rgba });
+            if let Some(q) = inner.screen_queues.get_mut(&target) { q.clear(); }
+            inner.screen_cleared.insert(target);
         }
-    }
+    });
+}
+pub fn set_mask(x: i32, y: i32, handle: u32) {
+    with_inner_mut(|inner| inner.mask = Some((x, y, handle)));
+}
+pub fn reset_mask() {
+    with_inner_mut(|inner| inner.mask = None);
+}
+pub fn set_blend(blend: BlendMode) {
+    with_inner_mut(|inner| inner.blend = blend);
+}
 
-    // ── Window position ───────────────────────────────────────────────────────
+pub fn draw_image(target: u32, x: i32, y: i32, handle: u32) {
+    with_inner_mut(|inner| {
+        let mask = inner.mask;
+        push_draw_cmd(inner, target, DrawCommand::Sprite {
+            x, y, handle,
+            mask_handle: mask.map(|(_, _, mh)| mh),
+            mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
+            mask_oy:     mask.map(|(_, my, _)| my).unwrap_or(0),
+            params:      DrawSpriteParams::default(),
+            blend:       BlendMode::Normal,
+        });
+    });
+}
 
-    pub fn set_position(&self, x: i32, y: i32) {
-        let hwnd = self.inner_ref().hwnd.0;
-        unsafe {
-            use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
-            SetWindowPos(hwnd, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
-        }
-    }
+pub fn draw_image_ex(target: u32, x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
+    with_inner_mut(|inner| {
+        let mask  = inner.mask;
+        let blend = inner.blend;
+        push_draw_cmd(inner, target, DrawCommand::Sprite {
+            x, y, handle,
+            mask_handle: mask.map(|(_, _, mh)| mh),
+            mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
+            mask_oy:     mask.map(|(_, my, _)| my).unwrap_or(0),
+            params,
+            blend,
+        });
+    });
+}
 
-    pub fn position(&self) -> (i32, i32) {
-        let hwnd = self.inner_ref().hwnd.0;
-        unsafe {
-            use windows_sys::Win32::Foundation::RECT;
-            use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
-            let mut r: RECT = std::mem::zeroed();
-            GetWindowRect(hwnd, &mut r);
-            (r.left, r.top)
-        }
-    }
+pub fn draw_fill(target: u32, color: Color) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_fill(sw, sh, color);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
+pub fn draw_pixel(target: u32, x: i32, y: i32, color: Color) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_pixel(x, y, sw, sh, color);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
+pub fn draw_line(target: u32, x1: i32, y1: i32, x2: i32, y2: i32, color: Color) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_line(x1, y1, x2, y2, sw, sh, color);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
+pub fn draw_rectangle(target: u32, x: i32, y: i32, w: i32, h: i32, color: Color, filled: bool) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_rectangle(x, y, w, h, sw, sh, color, filled);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
+pub fn draw_circle(target: u32, cx: i32, cy: i32, radius: i32, color: Color, filled: bool) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_circle(cx, cy, radius, sw, sh, color, filled);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
+pub fn draw_triangle(target: u32, x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, color: Color, filled: bool) {
+    with_inner_mut(|inner| {
+        let (sw, sh) = target_size(inner, target);
+        let v = verts_triangle(x1, y1, x2, y2, x3, y3, sw, sh, color, filled);
+        if !v.is_empty() { push_draw_cmd(inner, target, DrawCommand::Polys { verts: v }); }
+    });
+}
 
-    // ── Screen factory ────────────────────────────────────────────────────────
+pub fn draw_text(target: u32, x: i32, y: i32, text: impl AsRef<str>, color: Color) {
+    let font = ensure_default_font();
+    draw_text_ex(target, x, y, text, color, font);
+}
+pub fn draw_text_ex(target: u32, x: i32, y: i32, text: impl AsRef<str>, color: Color, font: u32) {
+    if font == 0 { return; }
+    with_inner_mut(|inner| push_draw_cmd(inner, target, DrawCommand::Text { x, y, text: text.as_ref().to_string(), font, color }));
+}
 
-    pub fn create_screen(&mut self, w: u16, h: u16) -> crate::screen::Screen {
-        let inner = self.inner_mut();
+// ── Window position ───────────────────────────────────────────────────────────
+
+pub fn set_window_position(x: i32, y: i32) {
+    with_inner(|inner| unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::{SetWindowPos, SWP_NOSIZE, SWP_NOZORDER};
+        SetWindowPos(inner.hwnd.0, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
+    });
+}
+pub fn window_position() -> (i32, i32) {
+    with_inner(|inner| unsafe {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::GetWindowRect;
+        let mut r: RECT = std::mem::zeroed();
+        GetWindowRect(inner.hwnd.0, &mut r);
+        (r.left, r.top)
+    })
+}
+
+// ── Screen factory ────────────────────────────────────────────────────────────
+
+pub fn create_screen(w: u16, h: u16) -> u32 {
+    WINDOW.with(|win| {
+        let mut borrow = win.borrow_mut();
+        let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
         let ww = w as u32;
         let hh = h as u32;
         let sprite_id = crate::graphics::register_blank_sprite(ww, hh);
@@ -2142,166 +2318,63 @@ impl Window {
             usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats:    &[],
         });
-        let view = texture.create_view(&Default::default());
+        // Sample view (for draw_image to read this screen as a sprite)
+        let sample_view = texture.create_view(&Default::default());
+        // Render view (for rendering draw commands into this screen)
+        let render_view = texture.create_view(&Default::default());
         inner.sprite_cache.insert(sprite_id, SpriteGpuData {
             _texture:   None,
-            view,
+            view:       sample_view,
             width:      ww,
             height:     hh,
             gpu_native: true,
         });
-        crate::screen::Screen::with_gpu(
-            w, h, sprite_id,
-            inner.device.clone(), inner.queue.clone(), texture,
-            Arc::clone(&inner.color_pipeline),
-            Arc::clone(&inner.sprite_pipeline),
-            Arc::clone(&inner.sprite_pipeline_add),
-            Arc::clone(&inner.sprite_pipeline_mul),
-            Arc::clone(&inner.sprite_bgl),
-        )
-    }
+        inner.screen_textures.insert(sprite_id, (texture, render_view, ww, hh));
+        inner.screen_queues.insert(sprite_id, Vec::new());
+        sprite_id
+    })
+}
 
-    // ── Drawing ───────────────────────────────────────────────────────────────
+// ── Overlay API ───────────────────────────────────────────────────────────────
 
-    pub fn screen_clear(&mut self) {
-        self.inner_mut().draw_queue.clear();
-    }
-
-    pub fn screen_mask_set(&mut self, x: i32, y: i32, handle: u32) {
-        self.inner_mut().mask = Some((x, y, handle));
-    }
-
-    pub fn screen_mask_reset(&mut self) {
-        self.inner_mut().mask = None;
-    }
-
-    pub fn screen_draw_sprite(&mut self, x: i32, y: i32, handle: u32) {
-        let inner = self.inner_mut();
-        let mask = inner.mask;
-        inner.draw_queue.push(DrawCommand::Sprite {
-            x, y, handle,
-            mask_handle: mask.map(|(_, _, mh)| mh),
-            mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
-            mask_oy:     mask.map(|(_, my, _)| my).unwrap_or(0),
-            params:      DrawSpriteParams::default(),
-            blend:       BlendMode::Normal,
-        });
-    }
-
-    pub fn screen_draw_sprite_ex(&mut self, x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
-        let inner = self.inner_mut();
-        let mask  = inner.mask;
-        let blend = inner.blend;
-        inner.draw_queue.push(DrawCommand::Sprite {
-            x, y, handle,
-            mask_handle: mask.map(|(_, _, mh)| mh),
-            mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
-            mask_oy:     mask.map(|(_, my, _)| my).unwrap_or(0),
-            params,
-            blend,
-        });
-    }
-
-    pub fn screen_blend_set(&mut self, blend: BlendMode) {
-        self.inner_mut().blend = blend;
-    }
-
-    fn push_polys(&mut self, verts: Vec<ColorVert>) {
-        if !verts.is_empty() {
-            self.inner_mut().draw_queue.push(DrawCommand::Polys { verts });
-        }
-    }
-
-    pub fn screen_draw_fill(&mut self, color: Color) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_fill(sw, sh, color);
-        self.push_polys(v);
-    }
-
-    pub fn screen_draw_pixel(&mut self, x: i32, y: i32, color: Color) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_pixel(x, y, sw, sh, color);
-        self.push_polys(v);
-    }
-
-    pub fn screen_draw_line(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, color: Color) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_line(x1, y1, x2, y2, sw, sh, color);
-        self.push_polys(v);
-    }
-
-    pub fn screen_draw_rectangle(&mut self, x: i32, y: i32, w: i32, h: i32, color: Color, filled: bool) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_rectangle(x, y, w, h, sw, sh, color, filled);
-        self.push_polys(v);
-    }
-
-    pub fn screen_draw_circle(&mut self, cx: i32, cy: i32, radius: i32, color: Color, filled: bool) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_circle(cx, cy, radius, sw, sh, color, filled);
-        self.push_polys(v);
-    }
-
-    pub fn screen_draw_triangle(&mut self, x1: i32, y1: i32, x2: i32, y2: i32, x3: i32, y3: i32, color: Color, filled: bool) {
-        let (sw, sh) = { let i = self.inner_ref(); (i.screen_width, i.screen_height) };
-        let v = verts_triangle(x1, y1, x2, y2, x3, y3, sw, sh, color, filled);
-        self.push_polys(v);
-    }
-
-    // ── Overlay API ───────────────────────────────────────────────────────────
-
-    /// オーバーレイを有効化する（init() の前に呼ぶ）。
-    pub fn overlay_enable(&mut self, enabled: bool) { self.overlay_enabled = enabled; }
-
-    /// オーバーレイの表示・非表示を切り替える。
-    pub fn overlay_visible(&mut self, visible: bool) {
-        self.overlay_visible = visible;
+pub fn overlay_visible(visible: bool) {
+    with_inner_mut(|inner| {
         #[cfg(target_os = "windows")]
-        if let Some(inner) = &mut self.inner {
-            if let Some(ov) = &mut inner.overlay {
-                ov.visible = visible;
-                use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE, SW_HIDE};
-                unsafe { ShowWindow(ov.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
-            }
+        if let Some(ov) = &mut inner.overlay {
+            ov.visible = visible;
+            use windows_sys::Win32::UI::WindowsAndMessaging::{ShowWindow, SW_SHOWNOACTIVATE, SW_HIDE};
+            unsafe { ShowWindow(ov.hwnd, if visible { SW_SHOWNOACTIVATE } else { SW_HIDE }); }
         }
-    }
-
-    /// オーバーレイの描画ブレンドモードを設定する。
-    pub fn overlay_blend_set(&mut self, blend: BlendMode) {
-        self.inner_mut().overlay_blend = blend;
-    }
-
-    /// オーバーレイにスプライトを描画する（マスクなし・メインウィンドウ上にも描ける）。
-    pub fn overlay_draw_sprite(&mut self, x: i32, y: i32, handle: u32) {
-        let blend = self.inner_ref().overlay_blend;
-        self.inner_mut().overlay_draw_queue.push(DrawCommand::Sprite {
+    });
+}
+pub fn overlay_blend_set(blend: BlendMode) {
+    with_inner_mut(|inner| inner.overlay_blend = blend);
+}
+pub fn overlay_draw_image(x: i32, y: i32, handle: u32) {
+    with_inner_mut(|inner| {
+        let blend = inner.overlay_blend;
+        inner.overlay_draw_queue.push(DrawCommand::Sprite {
             x, y, handle, mask_handle: None, mask_ox: 0, mask_oy: 0,
             params: DrawSpriteParams::default(), blend,
         });
-    }
-
-    /// オーバーレイにスプライトを描画する（拡張パラメータ付き）。
-    pub fn overlay_draw_sprite_ex(&mut self, x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
-        let blend = self.inner_ref().overlay_blend;
-        self.inner_mut().overlay_draw_queue.push(DrawCommand::Sprite {
+    });
+}
+pub fn overlay_draw_image_ex(x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
+    with_inner_mut(|inner| {
+        let blend = inner.overlay_blend;
+        inner.overlay_draw_queue.push(DrawCommand::Sprite {
             x, y, handle, mask_handle: None, mask_ox: 0, mask_oy: 0,
             params, blend,
         });
-    }
-
-    /// オーバーレイにテキストを描画する。
-    pub fn overlay_draw_text(&mut self, x: i32, y: i32, text: impl AsRef<str>, color: Color) {
-        let font = self.ensure_default_font();
-        if font == 0 { return; }
-        if let Some((w, h, rgba)) = crate::text::build_text_bitmap(text.as_ref(), color, font) {
-            self.inner_mut().overlay_draw_queue.push(DrawCommand::Text { x, y, width: w, height: h, rgba });
-        }
-    }
-
-    /// オーバーレイの描画キューをクリアする。
-    pub fn overlay_clear(&mut self) {
-        self.inner_mut().overlay_draw_queue.clear();
-    }
+    });
+}
+pub fn overlay_draw_text(x: i32, y: i32, text: impl AsRef<str>, color: Color) {
+    let font = ensure_default_font();
+    if font == 0 { return; }
+    with_inner_mut(|inner| inner.overlay_draw_queue.push(DrawCommand::Text { x, y, text: text.as_ref().to_string(), font, color }));
+}
+pub fn overlay_clear() {
+    with_inner_mut(|inner| inner.overlay_draw_queue.clear());
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
