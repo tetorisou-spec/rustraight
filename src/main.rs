@@ -1,7 +1,13 @@
 use rustraight::prelude::*;
 
 fn main() {
-    init(WindowConfig { title: String::from("rustraight demo"), ..Default::default() });
+    // ウィンドウ初期化
+    init(WindowConfig {
+        title: String::from("rustraight demo"),
+        screen_width: 320,
+        screen_height: 240,
+        ..Default::default()
+    });
 
     let mut dt_holder: Vec<f32> = Vec::new();
     let mut frame_rate = 0.0;

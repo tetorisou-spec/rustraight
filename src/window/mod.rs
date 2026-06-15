@@ -21,6 +21,7 @@ struct Win32Events {
     resize_event:     Option<(u32, u32)>,
     cursor_moved:     Option<(i32, i32)>,
     mouse_btn_events: Vec<(u8, bool)>,
+    wheel_delta:      i32,
 }
 
 impl Win32Events {
@@ -31,6 +32,7 @@ impl Win32Events {
             resize_event:     self.resize_event.take(),
             cursor_moved:     self.cursor_moved.take(),
             mouse_btn_events: std::mem::take(&mut self.mouse_btn_events),
+            wheel_delta:      std::mem::replace(&mut self.wheel_delta, 0),
         }
     }
 }
@@ -105,6 +107,11 @@ unsafe extern "system" fn main_wnd_proc(
         WM_RBUTTONUP   => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((1, false))); 0 }
         WM_MBUTTONDOWN => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((2, true)));  0 }
         WM_MBUTTONUP   => { WIN32_EVENTS.with(|e| e.borrow_mut().mouse_btn_events.push((2, false))); 0 }
+        WM_MOUSEWHEEL  => {
+            let delta = ((wparam >> 16) as i16) as i32;
+            WIN32_EVENTS.with(|e| e.borrow_mut().wheel_delta += delta);
+            0
+        }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) }
     }
 }
@@ -2109,6 +2116,9 @@ pub fn advance_frame() -> bool {
             let btn = match btn { 0 => MouseButton::Left, 1 => MouseButton::Right, _ => MouseButton::Middle };
             crate::input::process_mouse_button(btn, pressed);
         }
+        if events.wheel_delta != 0 {
+            crate::input::process_mouse_wheel(events.wheel_delta);
+        }
         // リサイズは次フレームの ② で適用
         if let Some(sz) = events.resize_event {
             inner.pending_resize = Some(sz);
@@ -2289,6 +2299,33 @@ pub fn set_window_position(x: i32, y: i32) {
         SetWindowPos(inner.hwnd.0, 0, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER);
     });
 }
+
+/// ウィンドウのクライアント領域を指定ピクセルサイズに変更する。
+pub fn set_window_size(w: u32, h: u32) {
+    with_inner(|inner| unsafe {
+        use windows_sys::Win32::Foundation::RECT;
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            AdjustWindowRectEx, GetWindowLongW, SetWindowPos,
+            GWL_EXSTYLE, GWL_STYLE, SWP_NOMOVE, SWP_NOZORDER, SWP_NOACTIVATE,
+        };
+        let hwnd     = inner.hwnd.0;
+        let style    = GetWindowLongW(hwnd, GWL_STYLE)   as u32;
+        let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
+        let mut rect = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+        AdjustWindowRectEx(&mut rect, style, 0, ex_style);
+        let aw = rect.right  - rect.left;
+        let ah = rect.bottom - rect.top;
+        SetWindowPos(hwnd, 0, 0, 0, aw, ah, SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+    });
+}
+
+/// マウスカーソルの表示・非表示を切り替える。
+pub fn show_cursor(visible: bool) {
+    unsafe {
+        use windows_sys::Win32::UI::WindowsAndMessaging::ShowCursor;
+        ShowCursor(visible as i32);
+    }
+}
 pub fn window_position() -> (i32, i32) {
     with_inner(|inner| unsafe {
         use windows_sys::Win32::Foundation::RECT;
@@ -2297,6 +2334,40 @@ pub fn window_position() -> (i32, i32) {
         GetWindowRect(inner.hwnd.0, &mut r);
         (r.left, r.top)
     })
+}
+
+/// 仮想解像度（スクリーンレンダーターゲット）を変更する。init() 後に呼び出し可能。
+pub fn set_screen_size(w: u16, h: u16) {
+    WINDOW.with(|win| {
+        let mut borrow = win.borrow_mut();
+        let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
+        let sw = w as u32;
+        let sh = h as u32;
+        let new_texture = inner.device.create_texture(&wgpu::TextureDescriptor {
+            label:           Some("screen"),
+            size:            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
+            mip_level_count: 1,
+            sample_count:    1,
+            dimension:       wgpu::TextureDimension::D2,
+            format:          wgpu::TextureFormat::Rgba8Unorm,
+            usage:           wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats:    &[],
+        });
+        let new_view = new_texture.create_view(&Default::default());
+        let new_bg = inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label:   Some("blit_bg"),
+            layout:  &inner.blit_pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&new_view) },
+                wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
+            ],
+        });
+        inner.screen_texture      = new_texture;
+        inner.screen_texture_view = new_view;
+        inner.blit_bind_group     = new_bg;
+        inner.screen_width        = sw;
+        inner.screen_height       = sh;
+    });
 }
 
 // ── Screen factory ────────────────────────────────────────────────────────────

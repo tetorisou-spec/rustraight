@@ -205,14 +205,15 @@ pub fn is_released(key: KeyCode) -> bool {
 pub enum MouseButton { Left, Right, Middle }
 
 struct MouseState {
-    x:        i32,
-    y:        i32,
-    current:  [bool; 3],
-    previous: [bool; 3],
+    x:           i32,
+    y:           i32,
+    current:     [bool; 3],
+    previous:    [bool; 3],
+    wheel_delta: i32,
 }
 
 impl Default for MouseState {
-    fn default() -> Self { Self { x: 0, y: 0, current: [false; 3], previous: [false; 3] } }
+    fn default() -> Self { Self { x: 0, y: 0, current: [false; 3], previous: [false; 3], wheel_delta: 0 } }
 }
 
 fn btn_idx(b: MouseButton) -> usize {
@@ -224,7 +225,11 @@ thread_local! {
 }
 
 pub(crate) fn commit_mouse_input() {
-    MOUSE.with(|m| { let mut m = m.borrow_mut(); m.previous = m.current; });
+    MOUSE.with(|m| { let mut m = m.borrow_mut(); m.previous = m.current; m.wheel_delta = 0; });
+}
+
+pub(crate) fn process_mouse_wheel(delta: i32) {
+    MOUSE.with(|m| m.borrow_mut().wheel_delta += delta);
 }
 
 pub(crate) fn process_mouse_move(x: i32, y: i32) {
@@ -249,4 +254,9 @@ pub fn is_mouse_just_pressed(btn: MouseButton) -> bool {
 
 pub fn is_mouse_released(btn: MouseButton) -> bool {
     MOUSE.with(|m| { let m = m.borrow(); !m.current[btn_idx(btn)] && m.previous[btn_idx(btn)] })
+}
+
+/// このフレームのマウスホイール回転量を返す（上方向が正、1ノッチ=120）。
+pub fn mouse_wheel() -> i32 {
+    MOUSE.with(|m| m.borrow().wheel_delta)
 }

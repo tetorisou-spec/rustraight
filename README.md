@@ -105,6 +105,9 @@ delta_time()    -> f32   // 前フレームからの秒数
 elapsed_time()  -> f64   // アプリ起動からの経過秒数
 set_window_position(x, y)
 window_position() -> (i32, i32)
+set_window_size(w, h)    // ウィンドウのクライアント領域サイズを変更
+set_screen_size(w, h)    // 仮想解像度（スクリーンレンダーターゲット）を変更
+show_cursor(visible)     // マウスカーソルの表示 / 非表示
 ```
 
 ### グラフィックス
@@ -180,6 +183,7 @@ mouse_position()                          // (x, y) 仮想スクリーン座標
 is_mouse_pressed(MouseButton::Left)       // 押している間
 is_mouse_just_pressed(MouseButton::Right) // 押した瞬間
 is_mouse_released(MouseButton::Middle)    // 離した瞬間
+mouse_wheel()                             // ホイール回転量（上=正、1ノッチ=120）
 
 // ゲームパッド
 is_pad_pressed(0, PadButton::South)       // pad_id=0
