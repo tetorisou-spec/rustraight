@@ -2336,6 +2336,30 @@ pub fn window_position() -> (i32, i32) {
     })
 }
 
+/// ウィンドウのクライアント領域サイズを返す。
+pub fn window_size() -> (u32, u32) {
+    with_inner(|inner| (inner.surface_config.width, inner.surface_config.height))
+}
+
+/// 仮想解像度（スクリーンレンダーターゲット）のサイズを返す。
+pub fn screen_size() -> (u32, u32) {
+    with_inner(|inner| (inner.screen_width, inner.screen_height))
+}
+
+/// スプライトまたはサブスクリーンのサイズを返す。ハンドルが無効な場合は `(0, 0)`。
+pub fn image_size(handle: u32) -> (u32, u32) {
+    with_inner(|inner| {
+        // GPU ネイティブスクリーン（create_screen）
+        if let Some((_, _, w, h)) = inner.screen_textures.get(&handle) {
+            return (*w, *h);
+        }
+        // 通常スプライト
+        crate::graphics::get_sprite(handle)
+            .map(|s| (s.width, s.height))
+            .unwrap_or((0, 0))
+    })
+}
+
 /// 仮想解像度（スクリーンレンダーターゲット）を変更する。init() 後に呼び出し可能。
 pub fn set_screen_size(w: u16, h: u16) {
     WINDOW.with(|win| {

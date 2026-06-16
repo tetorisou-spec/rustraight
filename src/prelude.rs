@@ -12,7 +12,7 @@ pub use crate::window::{
     draw_triangle, elapsed_time, init, is_pad_connected, is_pad_just_pressed, is_pad_pressed,
     is_pad_released, overlay_blend_set, overlay_clear, overlay_draw_image,
     overlay_draw_image_ex, overlay_draw_text, overlay_visible, pad_axis, pad_count,
-    reset_mask, set_blend, set_font_file, set_font_size, set_mask, set_screen_size,
-    set_window_position, set_window_size, show_cursor, window_position, mouse_position,
-    WindowConfig,
+    image_size, reset_mask, screen_size, set_blend, set_font_file, set_font_size, set_mask,
+    set_screen_size, set_window_position, set_window_size, show_cursor, window_position,
+    window_size, mouse_position, WindowConfig,
 };

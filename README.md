@@ -107,6 +107,8 @@ set_window_position(x, y)
 window_position() -> (i32, i32)
 set_window_size(w, h)    // ウィンドウのクライアント領域サイズを変更
 set_screen_size(w, h)    // 仮想解像度（スクリーンレンダーターゲット）を変更
+window_size() -> (u32, u32)  // ウィンドウのクライアント領域サイズを取得
+screen_size() -> (u32, u32)  // 仮想解像度を取得
 show_cursor(visible)     // マウスカーソルの表示 / 非表示
 ```
 
@@ -119,6 +121,7 @@ show_cursor(visible)     // マウスカーソルの表示 / 非表示
 let spr: u32   = load_image("image.png");
 let sheet: [u32; 4] = load_div_image("sheet.png", 4, 32, 32);
 free_all_images();
+image_size(handle) -> (u32, u32)  // スプライト / サブスクリーンのサイズを取得
 
 // スプライト描画
 draw_image(target, x, y, handle);

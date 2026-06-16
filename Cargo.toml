@@ -1,6 +1,6 @@
 [package]
 name        = "rustraight"
-version     = "0.4.1"
+version     = "0.4.2"
 edition     = "2024"
 description = "A simple 2D game library for Rust, inspired by DXLib"
 license     = "MIT"
