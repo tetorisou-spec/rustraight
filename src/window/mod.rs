@@ -826,6 +826,9 @@ fn push_draw_cmd(inner: &mut WindowInner, target: u32, cmd: DrawCommand) {
     }
 }
 
+/// メインウィンドウを示す描画ターゲット定数。draw_* 関数の `target` 引数に渡す。
+pub const MAIN_SCREEN: u32 = 0;
+
 // ── init ──────────────────────────────────────────────────────────────────────
 
 pub fn init(config: WindowConfig) {

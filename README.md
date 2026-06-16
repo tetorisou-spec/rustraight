@@ -67,8 +67,8 @@ fn main() {
         if is_pressed(KeyCode::ArrowUp)    { y -= (speed * dt) as i32; }
         if is_pressed(KeyCode::ArrowDown)  { y += (speed * dt) as i32; }
 
-        draw_image(0, x, y, player);
-        draw_text(0, x, y + 20, format!("pos: ({x}, {y})"), Color::WHITE);
+        draw_image(MAIN_SCREEN, x, y, player);
+        draw_text(MAIN_SCREEN, x, y + 20, format!("pos: ({x}, {y})"), Color::WHITE);
     }
 
     // 4. リソース解放
@@ -114,16 +114,19 @@ show_cursor(visible)     // マウスカーソルの表示 / 非表示
 
 ### グラフィックス
 
-`target` には `0`（メインウィンドウ）またはサブスクリーンのハンドルを渡します。
+`target` には `MAIN_SCREEN`（メインウィンドウ）またはサブスクリーンのハンドルを渡します。
 
 ```rust
+// メインウィンドウを示す定数（draw_* の target 引数に使う）
+MAIN_SCREEN  // = 0
+
 // 画像の読み込み (WIC 経由: PNG / JPEG / BMP / TIFF / GIF / WebP 等)
 let spr: u32   = load_image("image.png");
 let sheet: [u32; 4] = load_div_image("sheet.png", 4, 32, 32);
 free_all_images();
 image_size(handle) -> (u32, u32)  // スプライト / サブスクリーンのサイズを取得
 
-// スプライト描画
+// スプライト描画（target には MAIN_SCREEN またはサブスクリーンのハンドルを渡す）
 draw_image(target, x, y, handle);
 draw_image_ex(target, x, y, handle, DrawSpriteParams {
     scale_x:  2.0,

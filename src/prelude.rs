@@ -14,5 +14,5 @@ pub use crate::window::{
     overlay_draw_image_ex, overlay_draw_text, overlay_visible, pad_axis, pad_count,
     image_size, reset_mask, screen_size, set_blend, set_font_file, set_font_size, set_mask,
     set_screen_size, set_window_position, set_window_size, show_cursor, window_position,
-    window_size, mouse_position, WindowConfig,
+    window_size, mouse_position, MAIN_SCREEN, WindowConfig,
 };

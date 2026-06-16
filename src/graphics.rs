@@ -7,10 +7,15 @@ pub struct SpriteData {
     pub rgba: Vec<u8>,
 }
 
-#[derive(Default)]
 struct SpriteStore {
     sprites: HashMap<u32, SpriteData>,
     next_id: u32,
+}
+
+impl Default for SpriteStore {
+    fn default() -> Self {
+        Self { sprites: HashMap::new(), next_id: 1 }
+    }
 }
 
 impl SpriteStore {

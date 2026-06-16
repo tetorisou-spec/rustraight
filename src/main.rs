@@ -9,19 +9,12 @@ fn main() {
         ..Default::default()
     });
 
-    let mut dt_holder: Vec<f32> = Vec::new();
-    let mut frame_rate = 0.0;
+    let screen = create_screen(320, 240);
+    draw_fill(screen, Color::RED);
 
     while advance_frame() {
-        let dt = delta_time();
-        dt_holder.push(dt);
-
-        if dt_holder.len() == 30 {
-            frame_rate = 1.0 / (dt_holder.iter().sum::<f32>() / 30.0);
-            dt_holder.clear();
-        }
-
-        draw_text(0, 0, 20, format!("delta time: {:.3}", dt), Color::WHITE);
-        draw_text(0, 0, 0, format!("frame rate: {:.2}", frame_rate), Color::WHITE);
+        draw_image(MAIN_SCREEN,0,0,screen);
     }
+
+    free_all_images();
 }
