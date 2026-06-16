@@ -1,45 +1,49 @@
 use std::cell::RefCell;
 use std::collections::HashMap;
 
-pub struct SpriteData {
+pub struct ImageData {
     pub width: u32,
     pub height: u32,
     pub rgba: Vec<u8>,
 }
 
-struct SpriteStore {
-    sprites: HashMap<u32, SpriteData>,
+struct ImageStore {
+    images: HashMap<u32, ImageData>,
     next_id: u32,
 }
 
-impl Default for SpriteStore {
+impl Default for ImageStore {
     fn default() -> Self {
-        Self { sprites: HashMap::new(), next_id: 1 }
+        Self { images: HashMap::new(), next_id: 1 }
     }
 }
 
-impl SpriteStore {
-    fn insert(&mut self, data: SpriteData) -> u32 {
+impl ImageStore {
+    fn insert(&mut self, data: ImageData) -> u32 {
         let id = self.next_id;
-        self.sprites.insert(id, data);
+        self.images.insert(id, data);
         self.next_id += 1;
         id
     }
 
-    fn get(&self, id: u32) -> Option<&SpriteData> {
-        self.sprites.get(&id)
+    fn get(&self, id: u32) -> Option<&ImageData> {
+        self.images.get(&id)
+    }
+
+    fn remove(&mut self, id: u32) {
+        self.images.remove(&id);
     }
 
     fn clear(&mut self) {
-        self.sprites.clear();
+        self.images.clear();
     }
 }
 
 thread_local! {
-    static STORE: RefCell<SpriteStore> = RefCell::new(SpriteStore::default());
+    static STORE: RefCell<ImageStore> = RefCell::new(ImageStore::default());
 }
 
-fn missing_sprite() -> SpriteData {
+fn missing_image() -> ImageData {
     const W: u32 = 8;
     const H: u32 = 8;
     let mut rgba = vec![0u8; (W * H * 4) as usize];
@@ -49,13 +53,13 @@ fn missing_sprite() -> SpriteData {
         pixel[2] = 0xFF;
         pixel[3] = 0xFF;
     }
-    SpriteData { width: W, height: H, rgba }
+    ImageData { width: W, height: H, rgba }
 }
 
 /// WIC (Windows Imaging Component) で画像ファイルを RGBA8 にデコードする。
 /// PNG/JPEG/BMP/TIFF/GIF/WebP など WIC が対応する全フォーマットを読める。
 #[cfg(target_os = "windows")]
-fn load_image_wic(path: &str) -> Option<SpriteData> {
+fn load_image_wic(path: &str) -> Option<ImageData> {
     use windows::{
         core::PCWSTR,
         Win32::Foundation::GENERIC_ACCESS_RIGHTS,
@@ -110,17 +114,17 @@ fn load_image_wic(path: &str) -> Option<SpriteData> {
             .CopyPixels(std::ptr::null(), stride, &mut rgba)
             .ok()?;
 
-        Some(SpriteData { width, height, rgba })
+        Some(ImageData { width, height, rgba })
     }
 }
 
-fn decode_image_file(path: &str) -> SpriteData {
+fn decode_image_file(path: &str) -> ImageData {
     #[cfg(target_os = "windows")]
     if let Some(s) = load_image_wic(path) {
         return s;
     }
     crate::log_warn!("画像の読み込みに失敗しました: '{path}'、代替スプライトを使用します");
-    missing_sprite()
+    missing_image()
 }
 
 pub fn load_image(path: &str) -> u32 {
@@ -128,7 +132,9 @@ pub fn load_image(path: &str) -> u32 {
     STORE.with(|s| s.borrow_mut().insert(data))
 }
 
-pub fn load_div_image(path: &str, count: usize, tile_w: u32, tile_h: u32) -> Vec<u32> {
+pub fn load_div_image(path: &str, count: usize, tile_w: i32, tile_h: i32) -> Vec<u32> {
+    let tile_w = if tile_w < 1 { crate::log_warn!("load_div_image: 無効な tile_w {tile_w}。1 にクリップします。"); 1u32 } else { tile_w as u32 };
+    let tile_h = if tile_h < 1 { crate::log_warn!("load_div_image: 無効な tile_h {tile_h}。1 にクリップします。"); 1u32 } else { tile_h as u32 };
     let img = decode_image_file(path);
     let cols = img.width / tile_w;
     let rows = img.height / tile_h;
@@ -150,13 +156,17 @@ pub fn load_div_image(path: &str, count: usize, tile_w: u32, tile_h: u32) -> Vec
                 }
             }
             ids.push(STORE.with(|s| {
-                s.borrow_mut().insert(SpriteData { width: tile_w, height: tile_h, rgba: tile_rgba })
+                s.borrow_mut().insert(ImageData { width: tile_w, height: tile_h, rgba: tile_rgba })
             }));
         } else {
-            ids.push(STORE.with(|s| s.borrow_mut().insert(missing_sprite())));
+            ids.push(STORE.with(|s| s.borrow_mut().insert(missing_image())));
         }
     }
     ids
+}
+
+pub fn free_image(handle: u32) {
+    STORE.with(|s| s.borrow_mut().remove(handle));
 }
 
 pub fn free_all_images() {
@@ -164,9 +174,9 @@ pub fn free_all_images() {
 }
 
 #[allow(dead_code)]
-pub(crate) fn get_sprite(id: u32) -> Option<SpriteData> {
+pub(crate) fn get_image(id: u32) -> Option<ImageData> {
     STORE.with(|s| {
-        s.borrow().get(id).map(|d| SpriteData {
+        s.borrow().get(id).map(|d| ImageData {
             width: d.width,
             height: d.height,
             rgba: d.rgba.clone(),
@@ -174,9 +184,9 @@ pub(crate) fn get_sprite(id: u32) -> Option<SpriteData> {
     })
 }
 
-pub(crate) fn register_blank_sprite(width: u32, height: u32) -> u32 {
+pub(crate) fn register_blank_image(width: u32, height: u32) -> u32 {
     STORE.with(|s| {
-        s.borrow_mut().insert(SpriteData {
+        s.borrow_mut().insert(ImageData {
             width,
             height,
             rgba: vec![0u8; width as usize * height as usize * 4],
@@ -184,35 +194,35 @@ pub(crate) fn register_blank_sprite(width: u32, height: u32) -> u32 {
     })
 }
 
-pub(crate) fn with_sprite<F: FnOnce(u32, u32, &[u8])>(id: u32, f: F) {
+pub(crate) fn with_image<F: FnOnce(u32, u32, &[u8])>(id: u32, f: F) {
     STORE.with(|s| {
-        if let Some(sprite) = s.borrow().get(id) {
-            f(sprite.width, sprite.height, &sprite.rgba);
+        if let Some(image) = s.borrow().get(id) {
+            f(image.width, image.height, &image.rgba);
         }
     });
 }
 
-pub(crate) fn update_sprite(id: u32, rgba: &[u8]) {
+pub(crate) fn update_image(id: u32, rgba: &[u8]) {
     STORE.with(|s| {
-        if let Some(sprite) = s.borrow_mut().sprites.get_mut(&id) {
-            sprite.rgba.copy_from_slice(rgba);
+        if let Some(image) = s.borrow_mut().images.get_mut(&id) {
+            image.rgba.copy_from_slice(rgba);
         }
     });
 }
 
-pub(crate) fn blit_sprite_masked(
+pub(crate) fn blit_image_masked(
     dst: &mut [u8], dst_w: u32, dst_h: u32,
     x: i32, y: i32, handle: u32,
     mask_ox: i32, mask_oy: i32, mask_handle: u32,
 ) {
     STORE.with(|s| {
         let s = s.borrow();
-        let Some(sprite) = s.get(handle) else { return };
+        let Some(image) = s.get(handle) else { return };
         let Some(mask)   = s.get(mask_handle) else { return };
         let bw = dst_w as i32;
         let bh = dst_h as i32;
-        for sy in 0..sprite.height as i32 {
-            for sx in 0..sprite.width as i32 {
+        for sy in 0..image.height as i32 {
+            for sx in 0..image.width as i32 {
                 let px = x + sx;
                 let py = y + sy;
                 if px < 0 || py < 0 || px >= bw || py >= bh { continue; }
@@ -229,12 +239,12 @@ pub(crate) fn blit_sprite_masked(
                 };
                 if mask_alpha == 0 { continue; }
 
-                let src = (sy as usize * sprite.width as usize + sx as usize) * 4;
+                let src = (sy as usize * image.width as usize + sx as usize) * 4;
                 let di  = (py as usize * dst_w  as usize + px  as usize) * 4;
-                let effective_alpha = (sprite.rgba[src + 3] as u32 * mask_alpha as u32 / 255) as u8;
+                let effective_alpha = (image.rgba[src + 3] as u32 * mask_alpha as u32 / 255) as u8;
                 if effective_alpha == 0 { continue; }
                 if effective_alpha == 255 {
-                    dst[di..di + 4].copy_from_slice(&sprite.rgba[src..src + 4]);
+                    dst[di..di + 4].copy_from_slice(&image.rgba[src..src + 4]);
                 } else {
                     let sa = effective_alpha as f32 / 255.0;
                     let da = dst[di + 3] as f32 / 255.0;
@@ -242,9 +252,9 @@ pub(crate) fn blit_sprite_masked(
                     dst[di + 3] = (oa * 255.0) as u8;
                     if oa > 0.0 {
                         let oi = 1.0 / oa;
-                        dst[di]     = ((sprite.rgba[src]     as f32 * sa + dst[di]     as f32 * da * (1.0 - sa)) * oi) as u8;
-                        dst[di + 1] = ((sprite.rgba[src + 1] as f32 * sa + dst[di + 1] as f32 * da * (1.0 - sa)) * oi) as u8;
-                        dst[di + 2] = ((sprite.rgba[src + 2] as f32 * sa + dst[di + 2] as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di]     = ((image.rgba[src]     as f32 * sa + dst[di]     as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di + 1] = ((image.rgba[src + 1] as f32 * sa + dst[di + 1] as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di + 2] = ((image.rgba[src + 2] as f32 * sa + dst[di + 2] as f32 * da * (1.0 - sa)) * oi) as u8;
                     }
                 }
             }
@@ -252,23 +262,23 @@ pub(crate) fn blit_sprite_masked(
     });
 }
 
-pub(crate) fn blit_sprite(dst: &mut [u8], dst_w: u32, dst_h: u32, x: i32, y: i32, handle: u32) {
+pub(crate) fn blit_image(dst: &mut [u8], dst_w: u32, dst_h: u32, x: i32, y: i32, handle: u32) {
     STORE.with(|s| {
         let s = s.borrow();
-        let Some(sprite) = s.get(handle) else { return };
+        let Some(image) = s.get(handle) else { return };
         let bw = dst_w as i32;
         let bh = dst_h as i32;
-        for sy in 0..sprite.height as i32 {
-            for sx in 0..sprite.width as i32 {
+        for sy in 0..image.height as i32 {
+            for sx in 0..image.width as i32 {
                 let px = x + sx;
                 let py = y + sy;
                 if px < 0 || py < 0 || px >= bw || py >= bh { continue; }
-                let src = (sy as usize * sprite.width as usize + sx as usize) * 4;
+                let src = (sy as usize * image.width as usize + sx as usize) * 4;
                 let di = (py as usize * dst_w as usize + px as usize) * 4;
-                let a = sprite.rgba[src + 3];
+                let a = image.rgba[src + 3];
                 if a == 0 { continue; }
                 if a == 255 {
-                    dst[di..di + 4].copy_from_slice(&sprite.rgba[src..src + 4]);
+                    dst[di..di + 4].copy_from_slice(&image.rgba[src..src + 4]);
                 } else {
                     let sa = a as f32 / 255.0;
                     let da = dst[di + 3] as f32 / 255.0;
@@ -276,9 +286,9 @@ pub(crate) fn blit_sprite(dst: &mut [u8], dst_w: u32, dst_h: u32, x: i32, y: i32
                     dst[di + 3] = (oa * 255.0) as u8;
                     if oa > 0.0 {
                         let oi = 1.0 / oa;
-                        dst[di]     = ((sprite.rgba[src]     as f32 * sa + dst[di]     as f32 * da * (1.0 - sa)) * oi) as u8;
-                        dst[di + 1] = ((sprite.rgba[src + 1] as f32 * sa + dst[di + 1] as f32 * da * (1.0 - sa)) * oi) as u8;
-                        dst[di + 2] = ((sprite.rgba[src + 2] as f32 * sa + dst[di + 2] as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di]     = ((image.rgba[src]     as f32 * sa + dst[di]     as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di + 1] = ((image.rgba[src + 1] as f32 * sa + dst[di + 1] as f32 * da * (1.0 - sa)) * oi) as u8;
+                        dst[di + 2] = ((image.rgba[src + 2] as f32 * sa + dst[di + 2] as f32 * da * (1.0 - sa)) * oi) as u8;
                     }
                 }
             }
@@ -292,7 +302,7 @@ pub(crate) fn blit_sprite(dst: &mut [u8], dst_w: u32, dst_h: u32, x: i32, y: i32
 pub enum BlendMode { #[default] Normal, Add, Mul }
 
 #[derive(Copy, Clone)]
-pub struct DrawSpriteParams {
+pub struct DrawImageParams {
     pub scale_x:  f32,
     pub scale_y:  f32,
     pub rotation: f32,   // 度数法
@@ -301,7 +311,7 @@ pub struct DrawSpriteParams {
     pub flip_y:   bool,
 }
 
-impl Default for DrawSpriteParams {
+impl Default for DrawImageParams {
     fn default() -> Self {
         Self {
             scale_x:  1.0,

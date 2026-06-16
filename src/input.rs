@@ -207,13 +207,15 @@ pub enum MouseButton { Left, Right, Middle }
 struct MouseState {
     x:           i32,
     y:           i32,
+    prev_x:      i32,
+    prev_y:      i32,
     current:     [bool; 3],
     previous:    [bool; 3],
     wheel_delta: i32,
 }
 
 impl Default for MouseState {
-    fn default() -> Self { Self { x: 0, y: 0, current: [false; 3], previous: [false; 3], wheel_delta: 0 } }
+    fn default() -> Self { Self { x: 0, y: 0, prev_x: 0, prev_y: 0, current: [false; 3], previous: [false; 3], wheel_delta: 0 } }
 }
 
 fn btn_idx(b: MouseButton) -> usize {
@@ -225,7 +227,13 @@ thread_local! {
 }
 
 pub(crate) fn commit_mouse_input() {
-    MOUSE.with(|m| { let mut m = m.borrow_mut(); m.previous = m.current; m.wheel_delta = 0; });
+    MOUSE.with(|m| {
+        let mut m = m.borrow_mut();
+        m.previous = m.current;
+        m.prev_x = m.x;
+        m.prev_y = m.y;
+        m.wheel_delta = 0;
+    });
 }
 
 pub(crate) fn process_mouse_wheel(delta: i32) {
@@ -259,4 +267,9 @@ pub fn is_mouse_released(btn: MouseButton) -> bool {
 /// このフレームのマウスホイール回転量を返す（上方向が正、1ノッチ=120）。
 pub fn mouse_wheel() -> i32 {
     MOUSE.with(|m| m.borrow().wheel_delta)
+}
+
+/// 前フレームからのマウス移動量を返す（ピクセル単位）。
+pub fn mouse_delta() -> (i32, i32) {
+    MOUSE.with(|m| { let m = m.borrow(); (m.x - m.prev_x, m.y - m.prev_y) })
 }

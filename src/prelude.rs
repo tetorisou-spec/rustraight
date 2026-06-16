@@ -1,10 +1,10 @@
 pub use crate::{log_info, log_warn, log_error};
 pub use crate::draw::Color;
 pub use crate::gamepad::{PadAxis, PadButton};
-pub use crate::graphics::{BlendMode, DrawSpriteParams, free_all_images, load_div_image, load_image};
+pub use crate::graphics::{BlendMode, DrawImageParams, free_all_images, free_image, load_div_image, load_image};
 pub use crate::input::{is_just_pressed, is_mouse_just_pressed, is_mouse_pressed,
-    is_mouse_released, is_pressed, is_released, mouse_wheel, KeyCode, MouseButton};
-pub use crate::sound::{free_all_sounds, load_sound, play_sound, set_volume, stop_sound};
+    is_mouse_released, is_pressed, is_released, mouse_delta, mouse_wheel, KeyCode, MouseButton};
+pub use crate::sound::{free_all_sounds, free_sound, load_sound, play_sound, set_volume, stop_sound};
 pub use crate::text::{get_text_width, load_font};
 pub use crate::window::{
     advance_frame, clear, create_screen, delta_time, draw_circle, draw_fill, draw_image,

@@ -38,7 +38,7 @@ fn lin_to_srgb(x: f32) -> f32 {
 }
 "#;
 
-// Renders a textured sprite quad with optional mask modulation and per-vertex alpha.
+// Renders a textured image quad with optional mask modulation and per-vertex alpha.
 pub(super) const SPRITE_SHADER: &str = r#"
 struct Vin {
     @location(0) pos:       vec2<f32>,
@@ -62,14 +62,14 @@ struct Vout {
     @location(6) mask_on:   f32,
     @location(7) alpha:     f32,
 }
-@group(0) @binding(0) var t_sprite: texture_2d<f32>;
+@group(0) @binding(0) var t_image: texture_2d<f32>;
 @group(0) @binding(1) var t_mask:   texture_2d<f32>;
 @group(0) @binding(2) var s_samp:   sampler;
 @vertex fn vs(v: Vin) -> Vout {
     return Vout(vec4(v.pos, 0., 1.), v.uv, v.screen_xy, v.mask_ox, v.mask_oy, v.mask_w, v.mask_h, v.mask_on, v.alpha);
 }
 @fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
-    var c = textureSample(t_sprite, s_samp, in.uv);
+    var c = textureSample(t_image, s_samp, in.uv);
     if in.mask_on > 0.5 {
         let mx = (in.screen_xy.x - in.mask_ox) / in.mask_w;
         let my = (in.screen_xy.y - in.mask_oy) / in.mask_h;
@@ -84,7 +84,7 @@ struct Vout {
 }
 "#;
 
-// Sprite shader for overlay (screen_draw overflow): discards fragments inside main window rect.
+// Image shader for overlay (screen_draw overflow): discards fragments inside main window rect.
 pub(super) const MASKED_SPRITE_SHADER: &str = r#"
 struct Vin {
     @location(0) pos:       vec2<f32>, @location(1) uv:        vec2<f32>,
@@ -100,7 +100,7 @@ struct Vout {
     @location(4) mask_w:    f32,       @location(5) mask_h:    f32,
     @location(6) mask_on:   f32,       @location(7) alpha:     f32,
 }
-@group(0) @binding(0) var t_sprite: texture_2d<f32>;
+@group(0) @binding(0) var t_image: texture_2d<f32>;
 @group(0) @binding(1) var t_mask:   texture_2d<f32>;
 @group(0) @binding(2) var s_samp:   sampler;
 @group(1) @binding(0) var<uniform> main_rect: vec4<f32>; // x,y,w,h in display pixels
@@ -111,7 +111,7 @@ struct Vout {
     let p = in.clip.xy;
     if p.x >= main_rect.x && p.x < main_rect.x + main_rect.z
     && p.y >= main_rect.y && p.y < main_rect.y + main_rect.w { discard; }
-    var c = textureSample(t_sprite, s_samp, in.uv);
+    var c = textureSample(t_image, s_samp, in.uv);
     if in.mask_on > 0.5 {
         let mx = (in.screen_xy.x - in.mask_ox) / in.mask_w;
         let my = (in.screen_xy.y - in.mask_oy) / in.mask_h;

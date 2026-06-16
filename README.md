@@ -32,7 +32,7 @@
 
 ```toml
 [dependencies]
-rustraight = "0.4"
+rustraight = "0.5"
 ```
 
 ## クイックスタート
@@ -105,11 +105,11 @@ delta_time()    -> f32   // 前フレームからの秒数
 elapsed_time()  -> f64   // アプリ起動からの経過秒数
 set_window_position(x, y)
 window_position() -> (i32, i32)
-set_window_size(w, h)    // ウィンドウのクライアント領域サイズを変更
-set_screen_size(w, h)    // 仮想解像度（スクリーンレンダーターゲット）を変更
-window_size() -> (u32, u32)  // ウィンドウのクライアント領域サイズを取得
-screen_size() -> (u32, u32)  // 仮想解像度を取得
-show_cursor(visible)     // マウスカーソルの表示 / 非表示
+set_window_size(w: i32, h: i32)  // ウィンドウのクライアント領域サイズを変更
+set_screen_size(w: i32, h: i32)  // 仮想解像度（スクリーンレンダーターゲット）を変更
+window_size() -> (i32, i32)      // ウィンドウのクライアント領域サイズを取得
+screen_size() -> (i32, i32)      // 仮想解像度を取得
+show_cursor(visible)             // マウスカーソルの表示 / 非表示
 ```
 
 ### グラフィックス
@@ -121,10 +121,11 @@ show_cursor(visible)     // マウスカーソルの表示 / 非表示
 MAIN_SCREEN  // = 0
 
 // 画像の読み込み (WIC 経由: PNG / JPEG / BMP / TIFF / GIF / WebP 等)
-let spr: u32   = load_image("image.png");
-let sheet: [u32; 4] = load_div_image("sheet.png", 4, 32, 32);
+let spr: u32        = load_image("image.png");
+let sheet: [u32; 4] = load_div_image("sheet.png", 4, 32, 32);  // tile_w / tile_h は i32
+free_image(handle);   // 指定ハンドルの画像を解放
 free_all_images();
-image_size(handle) -> (u32, u32)  // スプライト / サブスクリーンのサイズを取得
+image_size(handle) -> (i32, i32)  // スプライト / サブスクリーンのサイズを取得
 
 // スプライト描画（target には MAIN_SCREEN またはサブスクリーンのハンドルを渡す）
 draw_image(target, x, y, handle);
@@ -185,7 +186,8 @@ is_just_pressed(KeyCode::Enter)  // 押した瞬間だけ true
 is_released(KeyCode::Escape)     // 離した瞬間だけ true
 
 // マウス
-mouse_position()                          // (x, y) 仮想スクリーン座標
+mouse_position() -> (i32, i32)            // (x, y) 仮想スクリーン座標
+mouse_delta()    -> (i32, i32)            // 前フレームからの移動量（ピクセル）
 is_mouse_pressed(MouseButton::Left)       // 押している間
 is_mouse_just_pressed(MouseButton::Right) // 押した瞬間
 is_mouse_released(MouseButton::Middle)    // 離した瞬間
@@ -210,6 +212,7 @@ play_sound(se,  false); // 1 回再生
 play_sound(bgm, true);  // ループ再生
 stop_sound(bgm);
 set_volume(bgm, 0.5);   // 音量 0.0 〜 1.0
+free_sound(bgm);        // 指定ハンドルの音声を解放（再生中なら停止してから）
 free_all_sounds();
 ```
 

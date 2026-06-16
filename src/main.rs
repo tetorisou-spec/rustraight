@@ -10,11 +10,11 @@ fn main() {
     });
 
     let screen = create_screen(320, 240);
-    draw_fill(screen, Color::RED);
 
     while advance_frame() {
+        clear(screen);
+        draw_rectangle(screen, 0,0,320,240,Color::rgba(255,255,255,127),true);
         draw_image(MAIN_SCREEN,0,0,screen);
     }
-
     free_all_images();
 }

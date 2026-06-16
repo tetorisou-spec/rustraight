@@ -1,5 +1,28 @@
 # Changelog
 
+## [0.5.0] - 2026-06-17
+
+### 破壊的変更
+
+サイズ・解像度を表すすべての公開 API の型を `i32` に統一しました。座標（`x`, `y`）がすでに `i32` であるため、型変換なしにサイズと組み合わせた計算ができます。無効な値（0 以下）が渡された場合は `log_warn!` を出力したうえで 1 にクリップします。
+
+- **`WindowConfig`**: `width`, `height`, `screen_width`, `screen_height` の型を `u16` → `i32` に変更
+- **`set_window_size(w: i32, h: i32)`**: `u32` → `i32`
+- **`set_screen_size(w: i32, h: i32)`**: `u16` → `i32`
+- **`create_screen(w: i32, h: i32) -> u32`**: `u16` → `i32`
+- **`window_size() -> (i32, i32)`**: `(u32, u32)` → `(i32, i32)`
+- **`screen_size() -> (i32, i32)`**: `(u32, u32)` → `(i32, i32)`
+- **`image_size(handle: u32) -> (i32, i32)`**: `(u32, u32)` → `(i32, i32)`
+- **`load_div_image(path, count, tile_w: i32, tile_h: i32)`**: `tile_w`, `tile_h` を `u32` → `i32`
+
+### 追加
+
+- **`free_image(handle: u32)`** — 指定ハンドルの画像データをメモリから解放する
+- **`free_sound(handle: u32)`** — 指定ハンドルの音声データを解放する。再生中の場合は停止してから解放する（`free_all_sounds()` と異なり、音声エンジン自体は維持される）
+- **`mouse_delta() -> (i32, i32)`** — 前フレームから現在フレームへのマウス移動量をピクセル単位で返す
+
+---
+
 ## [0.4.3] - 2026-06-16
 
 ### 追加

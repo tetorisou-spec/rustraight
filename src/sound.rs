@@ -186,6 +186,11 @@ mod backend {
                 unsafe { let _ = av.voice.SetVolume(volume, XAUDIO2_COMMIT_NOW); }
             }
         }
+
+        pub fn free(&mut self, handle: u32) {
+            self.voices.remove(&handle); // Drop が Stop + DestroyVoice を呼ぶ
+            self.sounds.remove(&handle);
+        }
     }
 
     /// RIFF WAV（PCM 8/16-bit）を i16 PCM サンプル列にデコードする。
@@ -266,6 +271,7 @@ mod backend {
         pub fn play(&mut self, _: u32, _: bool) {}
         pub fn stop(&mut self, _: u32) {}
         pub fn set_volume(&mut self, _: u32, _: f32) {}
+        pub fn free(&mut self, _: u32) {}
     }
 }
 
@@ -311,6 +317,15 @@ pub fn set_volume(handle: u32, volume: f32) {
     AUDIO.with(|a| {
         if let Some(state) = a.borrow_mut().as_mut() {
             state.set_volume(handle, volume);
+        }
+    });
+}
+
+/// 指定ハンドルの音声データを解放する。再生中の場合は停止してから解放する。
+pub fn free_sound(handle: u32) {
+    AUDIO.with(|a| {
+        if let Some(state) = a.borrow_mut().as_mut() {
+            state.free(handle);
         }
     });
 }

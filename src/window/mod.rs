@@ -8,7 +8,7 @@ use raw_window_handle::{Win32WindowHandle, WindowsDisplayHandle, RawWindowHandle
 
 use crate::draw::{Color, ColorVert, verts_circle, verts_fill, verts_line, verts_pixel, verts_rectangle, verts_triangle};
 use crate::gamepad::{GamepadManager, PadAxis, PadButton};
-use crate::graphics::{BlendMode, DrawSpriteParams};
+use crate::graphics::{BlendMode, DrawImageParams};
 use crate::input::MouseButton;
 use crate::util::{slice_as_bytes, block_on};
 
@@ -203,7 +203,7 @@ use shaders::{
 
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub(crate) struct SpriteVertex {
+pub(crate) struct ImageVertex {
     pos:       [f32; 2], // NDC
     uv:        [f32; 2],
     screen_xy: [f32; 2], // screen pixel position (interpolated, for mask sampling)
@@ -231,22 +231,22 @@ struct OverlayInner {
     staging_ready:         [std::sync::Arc<std::sync::atomic::AtomicBool>; 2],
     staging_pending:       [bool; 2],  // map_async 発行済みでまだ unmap していない
     // Masked pipelines: screen_draw overflow (Bgra8Unorm, discards main-window rect)
-    masked_sprite_pip:     wgpu::RenderPipeline,
-    masked_sprite_pip_add: wgpu::RenderPipeline,
-    masked_sprite_pip_mul: wgpu::RenderPipeline,
+    masked_image_pip:     wgpu::RenderPipeline,
+    masked_image_pip_add: wgpu::RenderPipeline,
+    masked_image_pip_mul: wgpu::RenderPipeline,
     masked_color_pip:      wgpu::RenderPipeline,
     // Unmasked pipelines: overlay_draw_* (Bgra8Unorm)
-    unmasked_sprite_pip:     wgpu::RenderPipeline,
-    unmasked_sprite_pip_add: wgpu::RenderPipeline,
-    unmasked_sprite_pip_mul: wgpu::RenderPipeline,
+    unmasked_image_pip:     wgpu::RenderPipeline,
+    unmasked_image_pip_add: wgpu::RenderPipeline,
+    unmasked_image_pip_mul: wgpu::RenderPipeline,
     unmasked_color_pip:      wgpu::RenderPipeline,
-    sprite_bgl:            Arc<wgpu::BindGroupLayout>,
+    image_bgl:            Arc<wgpu::BindGroupLayout>,
     #[allow(dead_code)]
     rect_bgl:              wgpu::BindGroupLayout,
     main_rect_buf:         wgpu::Buffer,
-    rect_bg_sprite:        wgpu::BindGroup,
+    rect_bg_image:        wgpu::BindGroup,
     rect_bg_color:         wgpu::BindGroup,
-    sprite_vbuf:           wgpu::Buffer,
+    image_vbuf:           wgpu::Buffer,
     #[allow(dead_code)]
     draw_queue:            Vec<DrawCommand>,
     #[allow(dead_code)]
@@ -341,7 +341,7 @@ fn compute_overlay_hash(draw_queue: &[DrawCommand], overlay_queue: &[DrawCommand
     let mut feed = |v: u64| { h ^= v; h = h.wrapping_mul(P); };
     for cmd in draw_queue {
         match cmd {
-            DrawCommand::Sprite { x, y, handle, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
+            DrawCommand::Image { x, y, handle, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
                 => { feed(*x as u64); feed(*y as u64); feed(*handle as u64); }
             DrawCommand::Text { x, y, color, .. } if *x < 0 || *y < 0 || *x >= sw || *y >= sh
                 => { feed(*x as u64); feed(*y as u64); feed(color.r as u64); feed(color.g as u64); feed(color.b as u64); feed(color.a as u64); }
@@ -350,7 +350,7 @@ fn compute_overlay_hash(draw_queue: &[DrawCommand], overlay_queue: &[DrawCommand
     }
     for cmd in overlay_queue {
         match cmd {
-            DrawCommand::Sprite { x, y, handle, .. } => { feed(*x as u64); feed(*y as u64); feed(*handle as u64); }
+            DrawCommand::Image { x, y, handle, .. } => { feed(*x as u64); feed(*y as u64); feed(*handle as u64); }
             DrawCommand::Text   { x, y, color, .. }   => { feed(*x as u64); feed(*y as u64); feed(color.r as u64); feed(color.g as u64); feed(color.b as u64); feed(color.a as u64); }
             DrawCommand::Polys  { verts }             => { feed(verts.len() as u64); }
         }
@@ -394,7 +394,7 @@ unsafe fn gdi_present(hwnd: isize, gdi_dc_mem: isize, display_w: u32, display_h:
 #[cfg(target_os = "windows")]
 fn build_overlay(
     device:     &wgpu::Device,
-    sprite_bgl: &Arc<wgpu::BindGroupLayout>,
+    image_bgl: &Arc<wgpu::BindGroupLayout>,
     visible:    bool,
 ) -> OverlayInner {
     let (dw, dh) = unsafe {
@@ -493,7 +493,7 @@ fn build_overlay(
     let main_rect_buf = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("main_rect"), size: 16, usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
-    let rect_bg_sprite = device.create_bind_group(&wgpu::BindGroupDescriptor {
+    let rect_bg_image = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None, layout: &rect_bgl,
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: main_rect_buf.as_entire_binding() }],
     });
@@ -502,12 +502,12 @@ fn build_overlay(
         entries: &[wgpu::BindGroupEntry { binding: 0, resource: main_rect_buf.as_entire_binding() }],
     });
 
-    // ── Masked sprite pipelines ───────────────────────────────────────────────
-    let masked_sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("msk_spr"), source: wgpu::ShaderSource::Wgsl(MASKED_SPRITE_SHADER.into()) });
-    let masked_sprite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None, bind_group_layouts: &[sprite_bgl, &rect_bgl], push_constant_ranges: &[],
+    // ── Masked image pipelines ───────────────────────────────────────────────
+    let masked_image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("msk_spr"), source: wgpu::ShaderSource::Wgsl(MASKED_SPRITE_SHADER.into()) });
+    let masked_image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None, bind_group_layouts: &[image_bgl, &rect_bgl], push_constant_ranges: &[],
     });
-    let sprite_attrs = [
+    let image_attrs = [
         wgpu::VertexAttribute { shader_location: 0, offset:  0, format: wgpu::VertexFormat::Float32x2 },
         wgpu::VertexAttribute { shader_location: 1, offset:  8, format: wgpu::VertexFormat::Float32x2 },
         wgpu::VertexAttribute { shader_location: 2, offset: 16, format: wgpu::VertexFormat::Float32x2 },
@@ -518,19 +518,19 @@ fn build_overlay(
         wgpu::VertexAttribute { shader_location: 7, offset: 40, format: wgpu::VertexFormat::Float32   },
         wgpu::VertexAttribute { shader_location: 8, offset: 44, format: wgpu::VertexFormat::Float32   },
     ];
-    let sprite_vbl = wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &sprite_attrs };
+    let image_vbl = wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &image_attrs };
     let mk_masked_spr = |blend: wgpu::BlendState| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None, layout: Some(&masked_sprite_layout),
-        vertex:   wgpu::VertexState { module: &masked_sprite_shader, entry_point: Some("vs"), buffers: &[sprite_vbl.clone()], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &masked_sprite_shader, entry_point: Some("fs"),
+        label: None, layout: Some(&masked_image_layout),
+        vertex:   wgpu::VertexState { module: &masked_image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &masked_image_shader, entry_point: Some("fs"),
             targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Bgra8Unorm, blend: Some(blend), write_mask: wgpu::ColorWrites::ALL })],
             compilation_options: Default::default() }),
         primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
         depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
-    let masked_sprite_pip     = mk_masked_spr(wgpu::BlendState::ALPHA_BLENDING);
-    let masked_sprite_pip_add = mk_masked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } });
-    let masked_sprite_pip_mul = mk_masked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add } });
+    let masked_image_pip     = mk_masked_spr(wgpu::BlendState::ALPHA_BLENDING);
+    let masked_image_pip_add = mk_masked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } });
+    let masked_image_pip_mul = mk_masked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add } });
 
     // ── Masked color pipeline ─────────────────────────────────────────────────
     let masked_color_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor { label: Some("msk_col"), source: wgpu::ShaderSource::Wgsl(MASKED_COLOR_SHADER.into()) });
@@ -554,26 +554,26 @@ fn build_overlay(
         depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
 
-    // ── Unmasked sprite/color pipelines (Bgra8Unorm, overlay_draw_* 用) ──────────
-    let unmasked_sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+    // ── Unmasked image/color pipelines (Bgra8Unorm, overlay_draw_* 用) ──────────
+    let unmasked_image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("ov_spr"), source: wgpu::ShaderSource::Wgsl(SPRITE_SHADER.into()),
     });
-    let unmasked_sprite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-        label: None, bind_group_layouts: &[sprite_bgl], push_constant_ranges: &[],
+    let unmasked_image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: None, bind_group_layouts: &[image_bgl], push_constant_ranges: &[],
     });
-    let sprite_vbl2 = wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &sprite_attrs };
+    let image_vbl2 = wgpu::VertexBufferLayout { array_stride: 48, step_mode: wgpu::VertexStepMode::Vertex, attributes: &image_attrs };
     let mk_unmasked_spr = |blend: wgpu::BlendState| device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-        label: None, layout: Some(&unmasked_sprite_layout),
-        vertex: wgpu::VertexState { module: &unmasked_sprite_shader, entry_point: Some("vs"), buffers: &[sprite_vbl2.clone()], compilation_options: Default::default() },
-        fragment: Some(wgpu::FragmentState { module: &unmasked_sprite_shader, entry_point: Some("fs"),
+        label: None, layout: Some(&unmasked_image_layout),
+        vertex: wgpu::VertexState { module: &unmasked_image_shader, entry_point: Some("vs"), buffers: &[image_vbl2.clone()], compilation_options: Default::default() },
+        fragment: Some(wgpu::FragmentState { module: &unmasked_image_shader, entry_point: Some("fs"),
             targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Bgra8Unorm, blend: Some(blend), write_mask: wgpu::ColorWrites::ALL })],
             compilation_options: Default::default() }),
         primitive: wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
         depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
-    let unmasked_sprite_pip     = mk_unmasked_spr(wgpu::BlendState::ALPHA_BLENDING);
-    let unmasked_sprite_pip_add = mk_unmasked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } });
-    let unmasked_sprite_pip_mul = mk_unmasked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add } });
+    let unmasked_image_pip     = mk_unmasked_spr(wgpu::BlendState::ALPHA_BLENDING);
+    let unmasked_image_pip_add = mk_unmasked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::SrcAlpha, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add } });
+    let unmasked_image_pip_mul = mk_unmasked_spr(wgpu::BlendState { color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add }, alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add } });
     let unmasked_color_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("ov_col"), source: wgpu::ShaderSource::Wgsl(COLOR_SHADER.into()),
     });
@@ -596,8 +596,8 @@ fn build_overlay(
         depth_stencil: None, multisample: wgpu::MultisampleState::default(), multiview: None, cache: None,
     });
 
-    let sprite_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("ov_sprite_vbuf"), size: 1024 * 6 * 48,
+    let image_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("ov_image_vbuf"), size: 1024 * 6 * 48,
         usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST, mapped_at_creation: false,
     });
 
@@ -607,11 +607,11 @@ fn build_overlay(
         staging_bufs, bytes_per_row, staging_idx: 0, staging_ready, staging_pending: [false; 2],
         prev_overlay_hash: u64::MAX,
         gdi_tx, gdi_rx, gdi_thread: Some(gdi_thread), reuse_buf: None,
-        masked_sprite_pip, masked_sprite_pip_add, masked_sprite_pip_mul, masked_color_pip,
-        unmasked_sprite_pip, unmasked_sprite_pip_add, unmasked_sprite_pip_mul, unmasked_color_pip,
-        sprite_bgl: Arc::clone(sprite_bgl),
-        rect_bgl, main_rect_buf, rect_bg_sprite, rect_bg_color,
-        sprite_vbuf,
+        masked_image_pip, masked_image_pip_add, masked_image_pip_mul, masked_color_pip,
+        unmasked_image_pip, unmasked_image_pip_add, unmasked_image_pip_mul, unmasked_color_pip,
+        image_bgl: Arc::clone(image_bgl),
+        rect_bgl, main_rect_buf, rect_bg_image, rect_bg_color,
+        image_vbuf,
         draw_queue: Vec::new(),
         blend: BlendMode::Normal,
         bg_cache: HashMap::new(),
@@ -620,10 +620,10 @@ fn build_overlay(
     }
 }
 
-// ── GPU sprite cache ──────────────────────────────────────────────────────────
+// ── GPU image cache ──────────────────────────────────────────────────────────
 
-struct SpriteGpuData {
-    _texture:   Option<wgpu::Texture>, // CPU-loaded sprites only; None = gpu_native (owned by Screen)
+struct ImageGpuData {
+    _texture:   Option<wgpu::Texture>, // CPU-loaded images only; None = gpu_native (owned by Screen)
     view:       wgpu::TextureView,
     width:      u32,
     height:     u32,
@@ -638,16 +638,16 @@ struct TextCacheEntry {
     last_used: u64,
 }
 
-fn ensure_sprite(
+fn ensure_image(
     handle: u32,
     device: &wgpu::Device,
     queue:  &wgpu::Queue,
-    cache:  &mut HashMap<u32, SpriteGpuData>,
+    cache:  &mut HashMap<u32, ImageGpuData>,
 ) {
-    // gpu_native screens upload themselves in Screen::sprite(); skip here
+    // gpu_native screens upload themselves in Screen::image(); skip here
     if cache.get(&handle).map(|e| e.gpu_native).unwrap_or(false) { return; }
 
-    crate::graphics::with_sprite(handle, |w, h, rgba| {
+    crate::graphics::with_image(handle, |w, h, rgba| {
         let entry = cache.entry(handle).or_insert_with(|| {
             let tex = device.create_texture(&wgpu::TextureDescriptor {
                 label:             None,
@@ -660,9 +660,9 @@ fn ensure_sprite(
                 view_formats:      &[],
             });
             let view = tex.create_view(&Default::default());
-            SpriteGpuData { _texture: Some(tex), view, width: w, height: h, gpu_native: false }
+            ImageGpuData { _texture: Some(tex), view, width: w, height: h, gpu_native: false }
         });
-        let tex = entry._texture.as_ref().expect("non-native sprite must have texture");
+        let tex = entry._texture.as_ref().expect("non-native image must have texture");
         queue.write_texture(
             wgpu::TexelCopyTextureInfo {
                 texture:   tex,
@@ -686,7 +686,7 @@ fn ensure_sprite(
 #[derive(Clone)]
 enum DrawCommand {
     Polys  { verts: Vec<ColorVert> },
-    Sprite { x: i32, y: i32, handle: u32, mask_handle: Option<u32>, mask_ox: i32, mask_oy: i32, params: DrawSpriteParams, blend: BlendMode },
+    Image { x: i32, y: i32, handle: u32, mask_handle: Option<u32>, mask_ox: i32, mask_oy: i32, params: DrawImageParams, blend: BlendMode },
     Text   { x: i32, y: i32, text: String, font: u32, color: Color },
 }
 
@@ -706,11 +706,15 @@ struct WindowInner {
     // Final blit to swap chain
     blit_pipeline:       wgpu::RenderPipeline,
     blit_bind_group:     wgpu::BindGroup,
-    // Sprite pipelines (Normal / Add / Mul blend modes)
-    sprite_pipeline:     Arc<wgpu::RenderPipeline>,
-    sprite_pipeline_add: Arc<wgpu::RenderPipeline>,
-    sprite_pipeline_mul: Arc<wgpu::RenderPipeline>,
-    sprite_bgl:          Arc<wgpu::BindGroupLayout>,
+    // Image pipelines (Normal / Add / Mul blend modes)
+    image_pipeline:        Arc<wgpu::RenderPipeline>,
+    image_pipeline_add:    Arc<wgpu::RenderPipeline>,
+    image_pipeline_mul:    Arc<wgpu::RenderPipeline>,
+    // Premultiplied-alpha variants for gpu_native (subscreen) textures
+    image_pipeline_pm:     Arc<wgpu::RenderPipeline>,
+    image_pipeline_pm_add: Arc<wgpu::RenderPipeline>,
+    image_pipeline_pm_mul: Arc<wgpu::RenderPipeline>,
+    image_bgl:          Arc<wgpu::BindGroupLayout>,
     // Color geometry pipeline (fills, lines, shapes)
     color_pipeline:      std::sync::Arc<wgpu::RenderPipeline>,
     // Shared sampler + dummy 1x1 white texture for unmasked draws
@@ -718,12 +722,12 @@ struct WindowInner {
     #[allow(dead_code)]
     dummy_texture:       wgpu::Texture,
     dummy_view:          wgpu::TextureView,
-    // Pre-allocated sprite vertex buffer
-    sprite_vbuf:         wgpu::Buffer, // 1024 sprites * 6 verts * 44 bytes
+    // Pre-allocated image vertex buffer
+    image_vbuf:         wgpu::Buffer, // 1024 images * 6 verts * 44 bytes
     // Per-frame draw queue (target=0: window)
     draw_queue:          Vec<DrawCommand>,
-    sprite_cache:        HashMap<u32, SpriteGpuData>,
-    sprite_bg_cache:     HashMap<(u32, Option<u32>), Arc<wgpu::BindGroup>>,
+    image_cache:        HashMap<u32, ImageGpuData>,
+    image_bg_cache:     HashMap<(u32, Option<u32>), Arc<wgpu::BindGroup>>,
     mask:                Option<(i32, i32, u32)>,
     blend:               BlendMode,
     // Offscreen screen targets
@@ -751,10 +755,10 @@ struct WindowInner {
 
 pub struct WindowConfig {
     pub title:           String,
-    pub width:           u16,
-    pub height:          u16,
-    pub screen_width:    u16,
-    pub screen_height:   u16,
+    pub width:           i32,
+    pub height:          i32,
+    pub screen_width:    i32,
+    pub screen_height:   i32,
     pub resizable:       bool,
     pub vsync:           bool,
     pub decorations:     bool,
@@ -832,11 +836,24 @@ pub const MAIN_SCREEN: u32 = 0;
 // ── init ──────────────────────────────────────────────────────────────────────
 
 pub fn init(config: WindowConfig) {
+        fn clip_size(v: i32, name: &str) -> u32 {
+            if v < 1 {
+                crate::log_warn!("WindowConfig::{name} に無効な値 {v} が指定されました。1 にクリップします。");
+                1
+            } else {
+                v as u32
+            }
+        }
+        let win_w  = clip_size(config.width,         "width");
+        let win_h  = clip_size(config.height,        "height");
+        let scr_w  = clip_size(config.screen_width,  "screen_width");
+        let scr_h  = clip_size(config.screen_height, "screen_height");
+
         #[cfg(target_os = "windows")]
         let hwnd = create_main_hwnd(
             &config.title,
-            config.width  as u32,
-            config.height as u32,
+            win_w,
+            win_h,
             config.resizable,
             config.decorations,
             config.transparent,
@@ -935,8 +952,8 @@ pub fn init(config: WindowConfig) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage:                         wgpu::TextureUsages::RENDER_ATTACHMENT,
             format:                        fmt,
-            width:                         config.width  as u32,
-            height:                        config.height as u32,
+            width:                         win_w,
+            height:                        win_h,
             present_mode:                  present,
             alpha_mode:                    alpha,
             view_formats:                  vec![],
@@ -944,8 +961,8 @@ pub fn init(config: WindowConfig) {
         };
         surface.configure(&device, &surface_config);
 
-        let sw = config.screen_width  as u32;
-        let sh = config.screen_height as u32;
+        let sw = scr_w;
+        let sh = scr_h;
         let screen_texture = device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("screen"),
             size:            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
@@ -1038,8 +1055,8 @@ pub fn init(config: WindowConfig) {
             cache:         None,
         });
 
-        let sprite_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-            label:   Some("sprite_bgl"),
+        let image_bgl = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label:   Some("image_bgl"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0, visibility: wgpu::ShaderStages::FRAGMENT,
@@ -1058,13 +1075,13 @@ pub fn init(config: WindowConfig) {
                 },
             ],
         });
-        let sprite_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
-            label: Some("sprite"), source: wgpu::ShaderSource::Wgsl(SPRITE_SHADER.into()),
+        let image_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("image"), source: wgpu::ShaderSource::Wgsl(SPRITE_SHADER.into()),
         });
-        let sprite_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-            label: Some("sprite_layout"), bind_group_layouts: &[&sprite_bgl], push_constant_ranges: &[],
+        let image_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("image_layout"), bind_group_layouts: &[&image_bgl], push_constant_ranges: &[],
         });
-        let sprite_attrs = [
+        let image_attrs = [
             wgpu::VertexAttribute { shader_location: 0, offset:  0, format: wgpu::VertexFormat::Float32x2 },
             wgpu::VertexAttribute { shader_location: 1, offset:  8, format: wgpu::VertexFormat::Float32x2 },
             wgpu::VertexAttribute { shader_location: 2, offset: 16, format: wgpu::VertexFormat::Float32x2 },
@@ -1075,17 +1092,17 @@ pub fn init(config: WindowConfig) {
             wgpu::VertexAttribute { shader_location: 7, offset: 40, format: wgpu::VertexFormat::Float32   },
             wgpu::VertexAttribute { shader_location: 8, offset: 44, format: wgpu::VertexFormat::Float32   },
         ];
-        let sprite_vbl = wgpu::VertexBufferLayout {
+        let image_vbl = wgpu::VertexBufferLayout {
             array_stride: 48,
             step_mode:    wgpu::VertexStepMode::Vertex,
-            attributes:   &sprite_attrs,
+            attributes:   &image_attrs,
         };
-        let sprite_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label:  Some("sprite"),
-            layout: Some(&sprite_layout),
-            vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs"), buffers: &[sprite_vbl.clone()], compilation_options: Default::default() },
+        let image_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &sprite_shader, entry_point: Some("fs"),
+                module: &image_shader, entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState { format: wgpu::TextureFormat::Rgba8Unorm, blend: Some(wgpu::BlendState::ALPHA_BLENDING), write_mask: wgpu::ColorWrites::ALL })],
                 compilation_options: Default::default(),
             }),
@@ -1095,12 +1112,12 @@ pub fn init(config: WindowConfig) {
             multiview:     None,
             cache:         None,
         });
-        let sprite_pipeline_add = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label:  Some("sprite_add"),
-            layout: Some(&sprite_layout),
-            vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs"), buffers: &[sprite_vbl.clone()], compilation_options: Default::default() },
+        let image_pipeline_add = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image_add"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &sprite_shader, entry_point: Some("fs"),
+                module: &image_shader, entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
                     blend: Some(wgpu::BlendState {
@@ -1117,12 +1134,12 @@ pub fn init(config: WindowConfig) {
             multiview:     None,
             cache:         None,
         });
-        let sprite_pipeline_mul = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label:  Some("sprite_mul"),
-            layout: Some(&sprite_layout),
-            vertex: wgpu::VertexState { module: &sprite_shader, entry_point: Some("vs"), buffers: &[sprite_vbl], compilation_options: Default::default() },
+        let image_pipeline_mul = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image_mul"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
             fragment: Some(wgpu::FragmentState {
-                module: &sprite_shader, entry_point: Some("fs"),
+                module: &image_shader, entry_point: Some("fs"),
                 targets: &[Some(wgpu::ColorTargetState {
                     format: wgpu::TextureFormat::Rgba8Unorm,
                     blend: Some(wgpu::BlendState {
@@ -1140,10 +1157,80 @@ pub fn init(config: WindowConfig) {
             cache:         None,
         });
 
-        let sprite_pipeline     = Arc::new(sprite_pipeline);
-        let sprite_pipeline_add = Arc::new(sprite_pipeline_add);
-        let sprite_pipeline_mul = Arc::new(sprite_pipeline_mul);
-        let sprite_bgl          = Arc::new(sprite_bgl);
+        let image_pipeline_pm = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image_pm"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive:     wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample:   wgpu::MultisampleState::default(),
+            multiview:     None,
+            cache:         None,
+        });
+        let image_pipeline_pm_add = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image_pm_add"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl.clone()], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One, dst_factor: wgpu::BlendFactor::One, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive:     wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample:   wgpu::MultisampleState::default(),
+            multiview:     None,
+            cache:         None,
+        });
+        let image_pipeline_pm_mul = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label:  Some("image_pm_mul"),
+            layout: Some(&image_layout),
+            vertex: wgpu::VertexState { module: &image_shader, entry_point: Some("vs"), buffers: &[image_vbl], compilation_options: Default::default() },
+            fragment: Some(wgpu::FragmentState {
+                module: &image_shader, entry_point: Some("fs"),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: wgpu::TextureFormat::Rgba8Unorm,
+                    blend: Some(wgpu::BlendState {
+                        color: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::Dst,  dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add },
+                        alpha: wgpu::BlendComponent { src_factor: wgpu::BlendFactor::One,  dst_factor: wgpu::BlendFactor::Zero, operation: wgpu::BlendOperation::Add },
+                    }),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+                compilation_options: Default::default(),
+            }),
+            primitive:     wgpu::PrimitiveState { topology: wgpu::PrimitiveTopology::TriangleList, ..Default::default() },
+            depth_stencil: None,
+            multisample:   wgpu::MultisampleState::default(),
+            multiview:     None,
+            cache:         None,
+        });
+
+        let image_pipeline        = Arc::new(image_pipeline);
+        let image_pipeline_add    = Arc::new(image_pipeline_add);
+        let image_pipeline_mul    = Arc::new(image_pipeline_mul);
+        let image_pipeline_pm     = Arc::new(image_pipeline_pm);
+        let image_pipeline_pm_add = Arc::new(image_pipeline_pm_add);
+        let image_pipeline_pm_mul = Arc::new(image_pipeline_pm_mul);
+        let image_bgl             = Arc::new(image_bgl);
 
         let color_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("color"), source: wgpu::ShaderSource::Wgsl(COLOR_SHADER.into()),
@@ -1175,8 +1262,8 @@ pub fn init(config: WindowConfig) {
             cache:         None,
         }));
 
-        let sprite_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
-            label:              Some("sprite_vbuf"),
+        let image_vbuf = device.create_buffer(&wgpu::BufferDescriptor {
+            label:              Some("image_vbuf"),
             size:               1024 * 6 * 48,
             usage:              wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
@@ -1184,7 +1271,7 @@ pub fn init(config: WindowConfig) {
 
         #[cfg(target_os = "windows")]
         let overlay = if config.overlay_enabled {
-            Some(Box::new(build_overlay(&device, &sprite_bgl, config.overlay_visible)))
+            Some(Box::new(build_overlay(&device, &image_bgl, config.overlay_visible)))
         } else {
             None
         };
@@ -1195,13 +1282,15 @@ pub fn init(config: WindowConfig) {
             screen_width: sw, screen_height: sh,
             screen_texture, screen_texture_view,
             blit_pipeline, blit_bind_group,
-            sprite_pipeline, sprite_pipeline_add, sprite_pipeline_mul, sprite_bgl,
+            image_pipeline, image_pipeline_add, image_pipeline_mul,
+            image_pipeline_pm, image_pipeline_pm_add, image_pipeline_pm_mul,
+            image_bgl,
             color_pipeline,
             sampler, dummy_texture, dummy_view,
-            sprite_vbuf,
+            image_vbuf,
             draw_queue:      Vec::new(),
-            sprite_cache:    HashMap::new(),
-            sprite_bg_cache: HashMap::new(),
+            image_cache:    HashMap::new(),
+            image_bg_cache: HashMap::new(),
             mask:            None,
             blend:           BlendMode::Normal,
             screen_textures: HashMap::new(),
@@ -1260,13 +1349,13 @@ pub fn advance_frame() -> bool {
                 (sid, cmds, do_clear)
             }).collect();
 
-            // Upload sprites needed by screen queues
+            // Upload images needed by screen queues
             for (_, cmds, _) in &screen_work {
                 for cmd in cmds {
-                    if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd {
-                        ensure_sprite(*handle, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                    if let DrawCommand::Image { handle, mask_handle, .. } = cmd {
+                        ensure_image(*handle, &inner.device, &inner.queue, &mut inner.image_cache);
                         if let Some(mh) = mask_handle {
-                            ensure_sprite(*mh, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                            ensure_image(*mh, &inner.device, &inner.queue, &mut inner.image_cache);
                         }
                     }
                 }
@@ -1334,9 +1423,9 @@ pub fn advance_frame() -> bool {
                 };
 
                 // Build vertex data
-                let mut scn_sprite_verts: Vec<SpriteVertex> = Vec::new();
+                let mut scn_image_verts: Vec<ImageVertex> = Vec::new();
                 let mut scn_color_verts:  Vec<ColorVert>    = Vec::new();
-                enum ScnItem { Polys { base: u32, count: u32 }, Sprite { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
+                enum ScnItem { Polys { base: u32, count: u32 }, Image { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
                 let mut scn_items: Vec<ScnItem> = Vec::new();
                 let mut scn_text_view_ptrs: Vec<*const wgpu::TextureView> = Vec::new();
 
@@ -1348,29 +1437,29 @@ pub fn advance_frame() -> bool {
                             scn_color_verts.extend_from_slice(verts);
                             scn_items.push(ScnItem::Polys { base, count });
                         }
-                        DrawCommand::Sprite { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
-                            if let Some(gd) = inner.sprite_cache.get(handle) {
-                                let base = scn_sprite_verts.len() as u32;
+                        DrawCommand::Image { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
+                            if let Some(gd) = inner.image_cache.get(handle) {
+                                let base = scn_image_verts.len() as u32;
                                 let (mox, moy, mw, mh, mon) = if let Some(mh) = mask_handle {
-                                    if let Some(md) = inner.sprite_cache.get(mh) {
+                                    if let Some(md) = inner.image_cache.get(mh) {
                                         (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32)
                                     } else { (0., 0., 1., 1., 0.) }
                                 } else { (0., 0., 1., 1., 0.) };
-                                scn_sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                                scn_image_verts.extend_from_slice(&build_image_quad_ex(
                                     *x, *y, gd.width, gd.height, scr_w, scr_h,
                                     mox, moy, mw, mh, mon, params,
                                 ));
-                                scn_items.push(ScnItem::Sprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
+                                scn_items.push(ScnItem::Image { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
                             }
                         }
                         DrawCommand::Text { x, y, text, font, color } => {
                             let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
                             if let Some(entry) = inner.text_cache.get(&key) {
                                 let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
-                                let base = scn_sprite_verts.len() as u32;
-                                scn_sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                                let base = scn_image_verts.len() as u32;
+                                scn_image_verts.extend_from_slice(&build_image_quad_ex(
                                     *x, *y, w, h, scr_w, scr_h,
-                                    0., 0., 1., 1., 0., &DrawSpriteParams::default(),
+                                    0., 0., 1., 1., 0., &DrawImageParams::default(),
                                 ));
                                 scn_text_view_ptrs.push(vptr);
                                 scn_items.push(ScnItem::Text { base });
@@ -1381,10 +1470,10 @@ pub fn advance_frame() -> bool {
 
                 // Build vertex buffers
                 use wgpu::util::DeviceExt;
-                let scn_sprite_buf = if !scn_sprite_verts.is_empty() {
+                let scn_image_buf = if !scn_image_verts.is_empty() {
                     Some(inner.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
                         label:    Some("scn_svbuf"),
-                        contents: slice_as_bytes(&scn_sprite_verts),
+                        contents: slice_as_bytes(&scn_image_verts),
                         usage:    wgpu::BufferUsages::VERTEX,
                     }))
                 } else { None };
@@ -1396,29 +1485,29 @@ pub fn advance_frame() -> bool {
                     }))
                 } else { None };
 
-                // Build sprite bind groups (reuse sprite_bg_cache)
-                let mut scn_sprite_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
+                // Build image bind groups (reuse image_bg_cache)
+                let mut scn_image_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
                 for item in &scn_items {
-                    if let ScnItem::Sprite { handle, mask_handle, .. } = item {
+                    if let ScnItem::Image { handle, mask_handle, .. } = item {
                         let key = (*handle, *mask_handle);
-                        if let Some(cached) = inner.sprite_bg_cache.get(&key) {
-                            scn_sprite_bgs.push(Arc::clone(cached));
-                        } else if let Some(gd) = inner.sprite_cache.get(handle) {
+                        if let Some(cached) = inner.image_bg_cache.get(&key) {
+                            scn_image_bgs.push(Arc::clone(cached));
+                        } else if let Some(gd) = inner.image_cache.get(handle) {
                             let mask_view = mask_handle
-                                .and_then(|mh| inner.sprite_cache.get(&mh))
+                                .and_then(|mh| inner.image_cache.get(&mh))
                                 .map(|md| &md.view)
                                 .unwrap_or(&inner.dummy_view);
                             let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                                 label:   None,
-                                layout:  &inner.sprite_bgl,
+                                layout:  &inner.image_bgl,
                                 entries: &[
                                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&gd.view) },
                                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask_view) },
                                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
                                 ],
                             }));
-                            inner.sprite_bg_cache.insert(key, Arc::clone(&bg));
-                            scn_sprite_bgs.push(bg);
+                            inner.image_bg_cache.insert(key, Arc::clone(&bg));
+                            scn_image_bgs.push(bg);
                         }
                     }
                 }
@@ -1429,7 +1518,7 @@ pub fn advance_frame() -> bool {
                     let view = unsafe { &**view_ptr };
                     scn_text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label:   None,
-                        layout:  &inner.sprite_bgl,
+                        layout:  &inner.image_bgl,
                         entries: &[
                             wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&inner.dummy_view) },
@@ -1474,25 +1563,29 @@ pub fn advance_frame() -> bool {
                                     rpass.draw(*base..*base + count, 0..1);
                                 }
                             }
-                            ScnItem::Sprite { base, blend, .. } => {
-                                if spr_idx < scn_sprite_bgs.len() {
-                                    let pipeline = match blend {
-                                        BlendMode::Normal => &inner.sprite_pipeline,
-                                        BlendMode::Add    => &inner.sprite_pipeline_add,
-                                        BlendMode::Mul    => &inner.sprite_pipeline_mul,
+                            ScnItem::Image { base, handle, blend, .. } => {
+                                if spr_idx < scn_image_bgs.len() {
+                                    let pm = inner.image_cache.get(handle).map(|g| g.gpu_native).unwrap_or(false);
+                                    let pipeline = match (blend, pm) {
+                                        (BlendMode::Normal, false) => &inner.image_pipeline,
+                                        (BlendMode::Normal, true)  => &inner.image_pipeline_pm,
+                                        (BlendMode::Add,    false) => &inner.image_pipeline_add,
+                                        (BlendMode::Add,    true)  => &inner.image_pipeline_pm_add,
+                                        (BlendMode::Mul,    false) => &inner.image_pipeline_mul,
+                                        (BlendMode::Mul,    true)  => &inner.image_pipeline_pm_mul,
                                     };
                                     rpass.set_pipeline(pipeline);
-                                    rpass.set_bind_group(0, &*scn_sprite_bgs[spr_idx], &[]);
-                                    rpass.set_vertex_buffer(0, scn_sprite_buf.as_ref().unwrap().slice(..));
+                                    rpass.set_bind_group(0, &*scn_image_bgs[spr_idx], &[]);
+                                    rpass.set_vertex_buffer(0, scn_image_buf.as_ref().unwrap().slice(..));
                                     rpass.draw(*base..*base + 6, 0..1);
                                     spr_idx += 1;
                                 }
                             }
                             ScnItem::Text { base } => {
                                 if text_idx < scn_text_bgs.len() {
-                                    rpass.set_pipeline(&inner.sprite_pipeline);
+                                    rpass.set_pipeline(&inner.image_pipeline);
                                     rpass.set_bind_group(0, &scn_text_bgs[text_idx], &[]);
-                                    rpass.set_vertex_buffer(0, scn_sprite_buf.as_ref().unwrap().slice(..));
+                                    rpass.set_vertex_buffer(0, scn_image_buf.as_ref().unwrap().slice(..));
                                     rpass.draw(*base..*base + 6, 0..1);
                                     text_idx += 1;
                                 }
@@ -1504,28 +1597,28 @@ pub fn advance_frame() -> bool {
             }
         }
 
-        // ③ Upload all sprite textures referenced this frame to GPU cache
+        // ③ Upload all image textures referenced this frame to GPU cache
         {
             let mut handles: Vec<(u32, Option<u32>)> = inner.draw_queue.iter()
-                .filter_map(|cmd| if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
+                .filter_map(|cmd| if let DrawCommand::Image { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
                 .collect();
-            // Also ensure sprites used in overlay_draw_* queue
+            // Also ensure images used in overlay_draw_* queue
             #[cfg(target_os = "windows")]
             handles.extend(inner.overlay_draw_queue.iter()
-                .filter_map(|cmd| if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None }));
+                .filter_map(|cmd| if let DrawCommand::Image { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None }));
             for (h, mh) in &handles {
-                ensure_sprite(*h, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                ensure_image(*h, &inner.device, &inner.queue, &mut inner.image_cache);
                 if let Some(mh) = mh {
-                    ensure_sprite(*mh, &inner.device, &inner.queue, &mut inner.sprite_cache);
+                    ensure_image(*mh, &inner.device, &inner.queue, &mut inner.image_cache);
                 }
             }
         }
 
         // ③ Build vertex data from draw queue
-        let mut sprite_verts: Vec<SpriteVertex> = Vec::new();
+        let mut image_verts: Vec<ImageVertex> = Vec::new();
         let mut color_verts:  Vec<ColorVert>    = Vec::new();
 
-        enum RItem { Polys { base: u32, count: u32 }, Sprite { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
+        enum RItem { Polys { base: u32, count: u32 }, Image { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode }, Text { base: u32 } }
         let mut items: Vec<RItem> = Vec::new();
         let mut text_view_ptrs: Vec<*const wgpu::TextureView> = Vec::new();
 
@@ -1537,31 +1630,31 @@ pub fn advance_frame() -> bool {
                     color_verts.extend_from_slice(verts);
                     items.push(RItem::Polys { base, count });
                 }
-                DrawCommand::Sprite { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
-                    if let Some(gd) = inner.sprite_cache.get(handle) {
-                        let base = sprite_verts.len() as u32;
+                DrawCommand::Image { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
+                    if let Some(gd) = inner.image_cache.get(handle) {
+                        let base = image_verts.len() as u32;
                         let (mox, moy, mw, mh, mon) = if let Some(mh) = mask_handle {
-                            if let Some(md) = inner.sprite_cache.get(mh) {
+                            if let Some(md) = inner.image_cache.get(mh) {
                                 (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32)
                             } else { (0.0, 0.0, 1.0, 1.0, 0.0) }
                         } else { (0.0, 0.0, 1.0, 1.0, 0.0) };
-                        sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                        image_verts.extend_from_slice(&build_image_quad_ex(
                             *x, *y, gd.width, gd.height,
                             inner.screen_width, inner.screen_height,
                             mox, moy, mw, mh, mon, params,
                         ));
-                        items.push(RItem::Sprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
+                        items.push(RItem::Image { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
                     }
                 }
                 DrawCommand::Text { x, y, text, font, color } => {
                     let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
                     if let Some(entry) = inner.text_cache.get(&key) {
                         let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
-                        let base = sprite_verts.len() as u32;
-                        sprite_verts.extend_from_slice(&build_sprite_quad_ex(
+                        let base = image_verts.len() as u32;
+                        image_verts.extend_from_slice(&build_image_quad_ex(
                             *x, *y, w, h,
                             inner.screen_width, inner.screen_height,
-                            0.0, 0.0, 1.0, 1.0, 0.0, &DrawSpriteParams::default(),
+                            0.0, 0.0, 1.0, 1.0, 0.0, &DrawImageParams::default(),
                         ));
                         text_view_ptrs.push(vptr);
                         items.push(RItem::Text { base });
@@ -1571,8 +1664,8 @@ pub fn advance_frame() -> bool {
         }
 
         // ④ Upload vertex data
-        if !sprite_verts.is_empty() {
-            inner.queue.write_buffer(&inner.sprite_vbuf, 0, slice_as_bytes(&sprite_verts));
+        if !image_verts.is_empty() {
+            inner.queue.write_buffer(&inner.image_vbuf, 0, slice_as_bytes(&image_verts));
         }
 
         // Dynamic color vertex buffer — created only when needed
@@ -1587,29 +1680,29 @@ pub fn advance_frame() -> bool {
             None
         };
 
-        // ⑤ Build bind groups for sprite draws (cached by texture+mask combination)
-        let mut sprite_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
+        // ⑤ Build bind groups for image draws (cached by texture+mask combination)
+        let mut image_bgs: Vec<Arc<wgpu::BindGroup>> = Vec::new();
         for item in &items {
-            if let RItem::Sprite { handle, mask_handle, .. } = item {
+            if let RItem::Image { handle, mask_handle, .. } = item {
                 let key = (*handle, *mask_handle);
-                if let Some(cached) = inner.sprite_bg_cache.get(&key) {
-                    sprite_bgs.push(Arc::clone(cached));
-                } else if let Some(sprite_gd) = inner.sprite_cache.get(handle) {
+                if let Some(cached) = inner.image_bg_cache.get(&key) {
+                    image_bgs.push(Arc::clone(cached));
+                } else if let Some(image_gd) = inner.image_cache.get(handle) {
                     let mask_view = mask_handle
-                        .and_then(|mh| inner.sprite_cache.get(&mh))
+                        .and_then(|mh| inner.image_cache.get(&mh))
                         .map(|md| &md.view)
                         .unwrap_or(&inner.dummy_view);
                     let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                         label:   None,
-                        layout:  &inner.sprite_bgl,
+                        layout:  &inner.image_bgl,
                         entries: &[
-                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&sprite_gd.view) },
+                            wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&image_gd.view) },
                             wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask_view) },
                             wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
                         ],
                     }));
-                    inner.sprite_bg_cache.insert(key, Arc::clone(&bg));
-                    sprite_bgs.push(bg);
+                    inner.image_bg_cache.insert(key, Arc::clone(&bg));
+                    image_bgs.push(bg);
                 }
             }
         }
@@ -1620,7 +1713,7 @@ pub fn advance_frame() -> bool {
             let view = unsafe { &**view_ptr };
             text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
                 label:   None,
-                layout:  &inner.sprite_bgl,
+                layout:  &inner.image_bgl,
                 entries: &[
                     wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&inner.dummy_view) },
@@ -1659,7 +1752,7 @@ pub fn advance_frame() -> bool {
                 occlusion_query_set:      None,
             });
 
-            let mut sprite_bg_idx = 0usize;
+            let mut image_bg_idx = 0usize;
             let mut text_bg_idx   = 0usize;
             for item in &items {
                 match item {
@@ -1670,25 +1763,29 @@ pub fn advance_frame() -> bool {
                             rpass.draw(*base..*base + count, 0..1);
                         }
                     }
-                    RItem::Sprite { base, blend, .. } => {
-                        if sprite_bg_idx < sprite_bgs.len() {
-                            let pipeline = match blend {
-                                BlendMode::Normal => &inner.sprite_pipeline,
-                                BlendMode::Add    => &inner.sprite_pipeline_add,
-                                BlendMode::Mul    => &inner.sprite_pipeline_mul,
+                    RItem::Image { base, handle, blend, .. } => {
+                        if image_bg_idx < image_bgs.len() {
+                            let pm = inner.image_cache.get(handle).map(|g| g.gpu_native).unwrap_or(false);
+                            let pipeline = match (blend, pm) {
+                                (BlendMode::Normal, false) => &inner.image_pipeline,
+                                (BlendMode::Normal, true)  => &inner.image_pipeline_pm,
+                                (BlendMode::Add,    false) => &inner.image_pipeline_add,
+                                (BlendMode::Add,    true)  => &inner.image_pipeline_pm_add,
+                                (BlendMode::Mul,    false) => &inner.image_pipeline_mul,
+                                (BlendMode::Mul,    true)  => &inner.image_pipeline_pm_mul,
                             };
                             rpass.set_pipeline(pipeline);
-                            rpass.set_bind_group(0, &*sprite_bgs[sprite_bg_idx], &[]);
-                            rpass.set_vertex_buffer(0, inner.sprite_vbuf.slice(..));
+                            rpass.set_bind_group(0, &*image_bgs[image_bg_idx], &[]);
+                            rpass.set_vertex_buffer(0, inner.image_vbuf.slice(..));
                             rpass.draw(*base..*base + 6, 0..1);
-                            sprite_bg_idx += 1;
+                            image_bg_idx += 1;
                         }
                     }
                     RItem::Text { base } => {
                         if text_bg_idx < text_bgs.len() {
-                            rpass.set_pipeline(&inner.sprite_pipeline);
+                            rpass.set_pipeline(&inner.image_pipeline);
                             rpass.set_bind_group(0, &text_bgs[text_bg_idx], &[]);
-                            rpass.set_vertex_buffer(0, inner.sprite_vbuf.slice(..));
+                            rpass.set_vertex_buffer(0, inner.image_vbuf.slice(..));
                             rpass.draw(*base..*base + 6, 0..1);
                             text_bg_idx += 1;
                         }
@@ -1728,7 +1825,7 @@ pub fn advance_frame() -> bool {
             let sw = inner.screen_width as i32;
             let sh = inner.screen_height as i32;
             let has_screen_overflow = inner.draw_queue.iter().any(|cmd| match cmd {
-                DrawCommand::Sprite { x, y, .. } => *x < 0 || *y < 0 || *x >= sw || *y >= sh,
+                DrawCommand::Image { x, y, .. } => *x < 0 || *y < 0 || *x >= sw || *y >= sh,
                 DrawCommand::Text   { x, y, .. } => *x < 0 || *y < 0 || *x >= sw || *y >= sh,
                 DrawCommand::Polys  { .. }       => false,
             });
@@ -1760,20 +1857,20 @@ pub fn advance_frame() -> bool {
             ];
             inner.queue.write_buffer(&ov.main_rect_buf, 0, slice_as_bytes(&main_rect));
 
-            // Upload screen_draw sprites to overlay bg_cache (shared key space)
+            // Upload screen_draw images to overlay bg_cache (shared key space)
             {
                 let handles: Vec<(u32, Option<u32>)> = inner.draw_queue.iter()
-                    .filter_map(|cmd| if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
+                    .filter_map(|cmd| if let DrawCommand::Image { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
                     .collect();
                 for (h, mh) in &handles {
                     let key = (*h, *mh);
                     if !ov.bg_cache.contains_key(&key) {
-                        if let Some(sprite_gd) = inner.sprite_cache.get(h) {
-                            let mask_view = mh.and_then(|m| inner.sprite_cache.get(&m)).map(|md| &md.view).unwrap_or(&inner.dummy_view);
+                        if let Some(image_gd) = inner.image_cache.get(h) {
+                            let mask_view = mh.and_then(|m| inner.image_cache.get(&m)).map(|md| &md.view).unwrap_or(&inner.dummy_view);
                             let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: None, layout: &ov.sprite_bgl,
+                                label: None, layout: &ov.image_bgl,
                                 entries: &[
-                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&sprite_gd.view) },
+                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&image_gd.view) },
                                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask_view) },
                                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
                                 ],
@@ -1782,19 +1879,19 @@ pub fn advance_frame() -> bool {
                         }
                     }
                 }
-                // overlay_draw_* sprites (inner.overlay_draw_queue is the correct source)
+                // overlay_draw_* images (inner.overlay_draw_queue is the correct source)
                 let ov_handles: Vec<(u32, Option<u32>)> = inner.overlay_draw_queue.iter()
-                    .filter_map(|cmd| if let DrawCommand::Sprite { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
+                    .filter_map(|cmd| if let DrawCommand::Image { handle, mask_handle, .. } = cmd { Some((*handle, *mask_handle)) } else { None })
                     .collect();
                 for (h, mh) in &ov_handles {
                     let key = (*h, *mh);
                     if !ov.bg_cache.contains_key(&key) {
-                        if let Some(sprite_gd) = inner.sprite_cache.get(h) {
-                            let mask_view = mh.and_then(|m| inner.sprite_cache.get(&m)).map(|md| &md.view).unwrap_or(&inner.dummy_view);
+                        if let Some(image_gd) = inner.image_cache.get(h) {
+                            let mask_view = mh.and_then(|m| inner.image_cache.get(&m)).map(|md| &md.view).unwrap_or(&inner.dummy_view);
                             let bg = Arc::new(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                                label: None, layout: &ov.sprite_bgl,
+                                label: None, layout: &ov.image_bgl,
                                 entries: &[
-                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&sprite_gd.view) },
+                                    wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(&image_gd.view) },
                                     wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(mask_view) },
                                     wgpu::BindGroupEntry { binding: 2, resource: wgpu::BindingResource::Sampler(&inner.sampler) },
                                 ],
@@ -1811,12 +1908,12 @@ pub fn advance_frame() -> bool {
             // Scale factors: virtual-screen pixels → window display pixels
             let scale_x = inner.surface_config.width  as f32 / inner.screen_width  as f32;
             let scale_y = inner.surface_config.height as f32 / inner.screen_height as f32;
-            let mut ov_sprite_verts: Vec<SpriteVertex> = Vec::new();
+            let mut ov_image_verts: Vec<ImageVertex> = Vec::new();
             let mut ov_color_verts:  Vec<crate::draw::ColorVert> = Vec::new();
-            enum OvItem { MaskedSprite  { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode },
+            enum OvItem { MaskedImage  { base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode },
                           MaskedColor   { base: u32, count: u32 },
                           MaskedText    { base: u32, text_idx: usize },
-                          UnmaskedSprite{ base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode },
+                          UnmaskedImage{ base: u32, handle: u32, mask_handle: Option<u32>, blend: BlendMode },
                           UnmaskedColor { base: u32, count: u32 },
                           UnmaskedText  { base: u32, text_idx: usize } }
             let mut ov_items: Vec<OvItem> = Vec::new();
@@ -1826,14 +1923,14 @@ pub fn advance_frame() -> bool {
             // screen_draw commands → masked
             for cmd in &inner.draw_queue {
                 match cmd {
-                    DrawCommand::Sprite { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
-                        if let Some(gd) = inner.sprite_cache.get(handle) {
-                            let base = ov_sprite_verts.len() as u32;
+                    DrawCommand::Image { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
+                        if let Some(gd) = inner.image_cache.get(handle) {
+                            let base = ov_image_verts.len() as u32;
                             let (mox, moy, mw, mh, mon) = if let Some(mhv) = mask_handle {
-                                if let Some(md) = inner.sprite_cache.get(mhv) { (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32) } else { (0.,0.,1.,1.,0.) }
+                                if let Some(md) = inner.image_cache.get(mhv) { (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32) } else { (0.,0.,1.,1.,0.) }
                             } else { (0.,0.,1.,1.,0.) };
-                            ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, gd.width, gd.height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, mox, moy, mw, mh, mon, params));
-                            ov_items.push(OvItem::MaskedSprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
+                            ov_image_verts.extend_from_slice(&build_image_quad_overlay(*x, *y, gd.width, gd.height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, mox, moy, mw, mh, mon, params));
+                            ov_items.push(OvItem::MaskedImage { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
                         }
                     }
                     DrawCommand::Polys { verts } => {
@@ -1855,9 +1952,9 @@ pub fn advance_frame() -> bool {
                             let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
                             if let Some(entry) = inner.text_cache.get(&key) {
                                 let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
-                                let base = ov_sprite_verts.len() as u32;
+                                let base = ov_image_verts.len() as u32;
                                 let text_idx = ov_text_view_ptrs.len();
-                                ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
+                                ov_image_verts.extend_from_slice(&build_image_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawImageParams::default()));
                                 ov_text_view_ptrs.push(vptr);
                                 ov_items.push(OvItem::MaskedText { base, text_idx });
                             }
@@ -1869,14 +1966,14 @@ pub fn advance_frame() -> bool {
             let ov_draw_queue_snapshot: Vec<DrawCommand> = inner.overlay_draw_queue.clone();
             for cmd in &ov_draw_queue_snapshot {
                 match cmd {
-                    DrawCommand::Sprite { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
-                        if let Some(gd) = inner.sprite_cache.get(handle) {
-                            let base = ov_sprite_verts.len() as u32;
+                    DrawCommand::Image { x, y, handle, mask_handle, mask_ox, mask_oy, params, blend } => {
+                        if let Some(gd) = inner.image_cache.get(handle) {
+                            let base = ov_image_verts.len() as u32;
                             let (mox, moy, mw, mh, mon) = if let Some(mhv) = mask_handle {
-                                if let Some(md) = inner.sprite_cache.get(mhv) { (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32) } else { (0.,0.,1.,1.,0.) }
+                                if let Some(md) = inner.image_cache.get(mhv) { (*mask_ox as f32, *mask_oy as f32, md.width as f32, md.height as f32, 1.0f32) } else { (0.,0.,1.,1.,0.) }
                             } else { (0.,0.,1.,1.,0.) };
-                            ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, gd.width, gd.height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, mox, moy, mw, mh, mon, params));
-                            ov_items.push(OvItem::UnmaskedSprite { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
+                            ov_image_verts.extend_from_slice(&build_image_quad_overlay(*x, *y, gd.width, gd.height, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, mox, moy, mw, mh, mon, params));
+                            ov_items.push(OvItem::UnmaskedImage { base, handle: *handle, mask_handle: *mask_handle, blend: *blend });
                         }
                     }
                     DrawCommand::Polys { verts } => {
@@ -1896,9 +1993,9 @@ pub fn advance_frame() -> bool {
                         let key = (text.clone(), *font, [color.r, color.g, color.b, color.a]);
                         if let Some(entry) = inner.text_cache.get(&key) {
                             let (w, h, vptr) = (entry.width, entry.height, &entry.view as *const wgpu::TextureView);
-                            let base = ov_sprite_verts.len() as u32;
+                            let base = ov_image_verts.len() as u32;
                             let text_idx = ov_text_view_ptrs.len();
-                            ov_sprite_verts.extend_from_slice(&build_sprite_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawSpriteParams::default()));
+                            ov_image_verts.extend_from_slice(&build_image_quad_overlay(*x, *y, w, h, dw, dh, main_pos.x, main_pos.y, scale_x, scale_y, 0., 0., 1., 1., 0., &DrawImageParams::default()));
                             ov_text_view_ptrs.push(vptr);
                             ov_items.push(OvItem::UnmaskedText { base, text_idx });
                         }
@@ -1907,8 +2004,8 @@ pub fn advance_frame() -> bool {
             }
 
             // Upload vertex data
-            if !ov_sprite_verts.is_empty() {
-                inner.queue.write_buffer(&ov.sprite_vbuf, 0, slice_as_bytes(&ov_sprite_verts));
+            if !ov_image_verts.is_empty() {
+                inner.queue.write_buffer(&ov.image_vbuf, 0, slice_as_bytes(&ov_image_verts));
             }
             let ov_color_buf: Option<wgpu::Buffer> = if !ov_color_verts.is_empty() {
                 use wgpu::util::DeviceExt;
@@ -1922,7 +2019,7 @@ pub fn advance_frame() -> bool {
             for view_ptr in &ov_text_view_ptrs {
                 let view = unsafe { &**view_ptr };
                 ov_text_bgs.push(inner.device.create_bind_group(&wgpu::BindGroupDescriptor {
-                    label: None, layout: &ov.sprite_bgl,
+                    label: None, layout: &ov.image_bgl,
                     entries: &[
                         wgpu::BindGroupEntry { binding: 0, resource: wgpu::BindingResource::TextureView(view) },
                         wgpu::BindGroupEntry { binding: 1, resource: wgpu::BindingResource::TextureView(&inner.dummy_view) },
@@ -1945,14 +2042,14 @@ pub fn advance_frame() -> bool {
                 let _unmasked_text_idx = 0usize;
                 for item in &ov_items {
                     match item {
-                        OvItem::MaskedSprite { base, handle, mask_handle, blend } => {
+                        OvItem::MaskedImage { base, handle, mask_handle, blend } => {
                             let key = (*handle, *mask_handle);
                             if let Some(bg) = ov.bg_cache.get(&key) {
-                                let pip = match blend { BlendMode::Normal => &ov.masked_sprite_pip, BlendMode::Add => &ov.masked_sprite_pip_add, BlendMode::Mul => &ov.masked_sprite_pip_mul };
+                                let pip = match blend { BlendMode::Normal => &ov.masked_image_pip, BlendMode::Add => &ov.masked_image_pip_add, BlendMode::Mul => &ov.masked_image_pip_mul };
                                 rpass.set_pipeline(pip);
                                 rpass.set_bind_group(0, &**bg, &[]);
-                                rpass.set_bind_group(1, &ov.rect_bg_sprite, &[]);
-                                rpass.set_vertex_buffer(0, ov.sprite_vbuf.slice(..));
+                                rpass.set_bind_group(1, &ov.rect_bg_image, &[]);
+                                rpass.set_vertex_buffer(0, ov.image_vbuf.slice(..));
                                 rpass.draw(*base..*base + 6, 0..1);
                             }
                         }
@@ -1966,23 +2063,23 @@ pub fn advance_frame() -> bool {
                         }
                         OvItem::MaskedText { base, text_idx } => {
                             if let Some(bg) = ov_text_bgs.get(*text_idx) {
-                                rpass.set_pipeline(&ov.masked_sprite_pip);
+                                rpass.set_pipeline(&ov.masked_image_pip);
                                 rpass.set_bind_group(0, bg, &[]);
-                                rpass.set_bind_group(1, &ov.rect_bg_sprite, &[]);
-                                rpass.set_vertex_buffer(0, ov.sprite_vbuf.slice(..));
+                                rpass.set_bind_group(1, &ov.rect_bg_image, &[]);
+                                rpass.set_vertex_buffer(0, ov.image_vbuf.slice(..));
                                 rpass.draw(*base..*base + 6, 0..1);
                             }
                         }
-                        OvItem::UnmaskedSprite { base, handle, mask_handle, blend } => {
+                        OvItem::UnmaskedImage { base, handle, mask_handle, blend } => {
                             if let Some(bg) = ov.bg_cache.get(&(*handle, *mask_handle)) {
                                 let pip = match blend {
-                                    BlendMode::Normal => &ov.unmasked_sprite_pip,
-                                    BlendMode::Add    => &ov.unmasked_sprite_pip_add,
-                                    BlendMode::Mul    => &ov.unmasked_sprite_pip_mul,
+                                    BlendMode::Normal => &ov.unmasked_image_pip,
+                                    BlendMode::Add    => &ov.unmasked_image_pip_add,
+                                    BlendMode::Mul    => &ov.unmasked_image_pip_mul,
                                 };
                                 rpass.set_pipeline(pip);
                                 rpass.set_bind_group(0, bg.as_ref(), &[]);
-                                rpass.set_vertex_buffer(0, ov.sprite_vbuf.slice(..));
+                                rpass.set_vertex_buffer(0, ov.image_vbuf.slice(..));
                                 rpass.draw(*base..*base + 6, 0..1);
                             }
                         }
@@ -1995,9 +2092,9 @@ pub fn advance_frame() -> bool {
                         }
                         OvItem::UnmaskedText { base, text_idx } => {
                             if let Some(bg) = ov_text_bgs.get(*text_idx) {
-                                rpass.set_pipeline(&ov.unmasked_sprite_pip);
+                                rpass.set_pipeline(&ov.unmasked_image_pip);
                                 rpass.set_bind_group(0, bg, &[]);
-                                rpass.set_vertex_buffer(0, ov.sprite_vbuf.slice(..));
+                                rpass.set_vertex_buffer(0, ov.image_vbuf.slice(..));
                                 rpass.draw(*base..*base + 6, 0..1);
                             }
                         }
@@ -2216,22 +2313,22 @@ pub fn set_blend(blend: BlendMode) {
 pub fn draw_image(target: u32, x: i32, y: i32, handle: u32) {
     with_inner_mut(|inner| {
         let mask = inner.mask;
-        push_draw_cmd(inner, target, DrawCommand::Sprite {
+        push_draw_cmd(inner, target, DrawCommand::Image {
             x, y, handle,
             mask_handle: mask.map(|(_, _, mh)| mh),
             mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
             mask_oy:     mask.map(|(_, my, _)| my).unwrap_or(0),
-            params:      DrawSpriteParams::default(),
+            params:      DrawImageParams::default(),
             blend:       BlendMode::Normal,
         });
     });
 }
 
-pub fn draw_image_ex(target: u32, x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
+pub fn draw_image_ex(target: u32, x: i32, y: i32, handle: u32, params: DrawImageParams) {
     with_inner_mut(|inner| {
         let mask  = inner.mask;
         let blend = inner.blend;
-        push_draw_cmd(inner, target, DrawCommand::Sprite {
+        push_draw_cmd(inner, target, DrawCommand::Image {
             x, y, handle,
             mask_handle: mask.map(|(_, _, mh)| mh),
             mask_ox:     mask.map(|(mx, _, _)| mx).unwrap_or(0),
@@ -2304,7 +2401,9 @@ pub fn set_window_position(x: i32, y: i32) {
 }
 
 /// ウィンドウのクライアント領域を指定ピクセルサイズに変更する。
-pub fn set_window_size(w: u32, h: u32) {
+pub fn set_window_size(w: i32, h: i32) {
+    let w = if w < 1 { crate::log_warn!("set_window_size: 無効な幅 {w}。1 にクリップします。"); 1i32 } else { w };
+    let h = if h < 1 { crate::log_warn!("set_window_size: 無効な高さ {h}。1 にクリップします。"); 1i32 } else { h };
     with_inner(|inner| unsafe {
         use windows_sys::Win32::Foundation::RECT;
         use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -2314,7 +2413,7 @@ pub fn set_window_size(w: u32, h: u32) {
         let hwnd     = inner.hwnd.0;
         let style    = GetWindowLongW(hwnd, GWL_STYLE)   as u32;
         let ex_style = GetWindowLongW(hwnd, GWL_EXSTYLE) as u32;
-        let mut rect = RECT { left: 0, top: 0, right: w as i32, bottom: h as i32 };
+        let mut rect = RECT { left: 0, top: 0, right: w, bottom: h };
         AdjustWindowRectEx(&mut rect, style, 0, ex_style);
         let aw = rect.right  - rect.left;
         let ah = rect.bottom - rect.top;
@@ -2340,36 +2439,36 @@ pub fn window_position() -> (i32, i32) {
 }
 
 /// ウィンドウのクライアント領域サイズを返す。
-pub fn window_size() -> (u32, u32) {
-    with_inner(|inner| (inner.surface_config.width, inner.surface_config.height))
+pub fn window_size() -> (i32, i32) {
+    with_inner(|inner| (inner.surface_config.width as i32, inner.surface_config.height as i32))
 }
 
 /// 仮想解像度（スクリーンレンダーターゲット）のサイズを返す。
-pub fn screen_size() -> (u32, u32) {
-    with_inner(|inner| (inner.screen_width, inner.screen_height))
+pub fn screen_size() -> (i32, i32) {
+    with_inner(|inner| (inner.screen_width as i32, inner.screen_height as i32))
 }
 
 /// スプライトまたはサブスクリーンのサイズを返す。ハンドルが無効な場合は `(0, 0)`。
-pub fn image_size(handle: u32) -> (u32, u32) {
+pub fn image_size(handle: u32) -> (i32, i32) {
     with_inner(|inner| {
         // GPU ネイティブスクリーン（create_screen）
         if let Some((_, _, w, h)) = inner.screen_textures.get(&handle) {
-            return (*w, *h);
+            return (*w as i32, *h as i32);
         }
         // 通常スプライト
-        crate::graphics::get_sprite(handle)
-            .map(|s| (s.width, s.height))
+        crate::graphics::get_image(handle)
+            .map(|s| (s.width as i32, s.height as i32))
             .unwrap_or((0, 0))
     })
 }
 
 /// 仮想解像度（スクリーンレンダーターゲット）を変更する。init() 後に呼び出し可能。
-pub fn set_screen_size(w: u16, h: u16) {
+pub fn set_screen_size(w: i32, h: i32) {
+    let sw = if w < 1 { crate::log_warn!("set_screen_size: 無効な幅 {w}。1 にクリップします。"); 1u32 } else { w as u32 };
+    let sh = if h < 1 { crate::log_warn!("set_screen_size: 無効な高さ {h}。1 にクリップします。"); 1u32 } else { h as u32 };
     WINDOW.with(|win| {
         let mut borrow = win.borrow_mut();
         let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
-        let sw = w as u32;
-        let sh = h as u32;
         let new_texture = inner.device.create_texture(&wgpu::TextureDescriptor {
             label:           Some("screen"),
             size:            wgpu::Extent3d { width: sw, height: sh, depth_or_array_layers: 1 },
@@ -2399,13 +2498,13 @@ pub fn set_screen_size(w: u16, h: u16) {
 
 // ── Screen factory ────────────────────────────────────────────────────────────
 
-pub fn create_screen(w: u16, h: u16) -> u32 {
+pub fn create_screen(w: i32, h: i32) -> u32 {
+    let ww = if w < 1 { crate::log_warn!("create_screen: 無効な幅 {w}。1 にクリップします。"); 1u32 } else { w as u32 };
+    let hh = if h < 1 { crate::log_warn!("create_screen: 無効な高さ {h}。1 にクリップします。"); 1u32 } else { h as u32 };
     WINDOW.with(|win| {
         let mut borrow = win.borrow_mut();
         let inner = borrow.as_mut().expect("rustraight: init() を先に呼んでください");
-        let ww = w as u32;
-        let hh = h as u32;
-        let sprite_id = crate::graphics::register_blank_sprite(ww, hh);
+        let image_id = crate::graphics::register_blank_image(ww, hh);
         let texture = inner.device.create_texture(&wgpu::TextureDescriptor {
             label:           None,
             size:            wgpu::Extent3d { width: ww, height: hh, depth_or_array_layers: 1 },
@@ -2416,20 +2515,20 @@ pub fn create_screen(w: u16, h: u16) -> u32 {
             usage:           wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST | wgpu::TextureUsages::RENDER_ATTACHMENT,
             view_formats:    &[],
         });
-        // Sample view (for draw_image to read this screen as a sprite)
+        // Sample view (for draw_image to read this screen as a image)
         let sample_view = texture.create_view(&Default::default());
         // Render view (for rendering draw commands into this screen)
         let render_view = texture.create_view(&Default::default());
-        inner.sprite_cache.insert(sprite_id, SpriteGpuData {
+        inner.image_cache.insert(image_id, ImageGpuData {
             _texture:   None,
             view:       sample_view,
             width:      ww,
             height:     hh,
             gpu_native: true,
         });
-        inner.screen_textures.insert(sprite_id, (texture, render_view, ww, hh));
-        inner.screen_queues.insert(sprite_id, Vec::new());
-        sprite_id
+        inner.screen_textures.insert(image_id, (texture, render_view, ww, hh));
+        inner.screen_queues.insert(image_id, Vec::new());
+        image_id
     })
 }
 
@@ -2451,16 +2550,16 @@ pub fn overlay_blend_set(blend: BlendMode) {
 pub fn overlay_draw_image(x: i32, y: i32, handle: u32) {
     with_inner_mut(|inner| {
         let blend = inner.overlay_blend;
-        inner.overlay_draw_queue.push(DrawCommand::Sprite {
+        inner.overlay_draw_queue.push(DrawCommand::Image {
             x, y, handle, mask_handle: None, mask_ox: 0, mask_oy: 0,
-            params: DrawSpriteParams::default(), blend,
+            params: DrawImageParams::default(), blend,
         });
     });
 }
-pub fn overlay_draw_image_ex(x: i32, y: i32, handle: u32, params: DrawSpriteParams) {
+pub fn overlay_draw_image_ex(x: i32, y: i32, handle: u32, params: DrawImageParams) {
     with_inner_mut(|inner| {
         let blend = inner.overlay_blend;
-        inner.overlay_draw_queue.push(DrawCommand::Sprite {
+        inner.overlay_draw_queue.push(DrawCommand::Image {
             x, y, handle, mask_handle: None, mask_ox: 0, mask_oy: 0,
             params, blend,
         });
@@ -2477,17 +2576,17 @@ pub fn overlay_clear() {
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
-pub(crate) fn build_sprite_quad_ex(
+pub(crate) fn build_image_quad_ex(
     x: i32, y: i32,
-    sprite_w: u32, sprite_h: u32,
+    image_w: u32, image_h: u32,
     screen_w: u32, screen_h: u32,
     mask_ox: f32, mask_oy: f32, mask_w: f32, mask_h: f32, mask_on: f32,
-    params: &DrawSpriteParams,
-) -> [SpriteVertex; 6] {
+    params: &DrawImageParams,
+) -> [ImageVertex; 6] {
     let sw     = screen_w as f32;
     let sh     = screen_h as f32;
-    let draw_w = sprite_w as f32 * params.scale_x;
-    let draw_h = sprite_h as f32 * params.scale_y;
+    let draw_w = image_w as f32 * params.scale_x;
+    let draw_h = image_h as f32 * params.scale_y;
     let cx     = x as f32 + draw_w * 0.5;
     let cy     = y as f32 + draw_h * 0.5;
     let hw     = draw_w * 0.5;
@@ -2513,7 +2612,7 @@ pub(crate) fn build_sprite_quad_ex(
     let (v0, v1) = if params.flip_y { (1.0f32, 0.0f32) } else { (0.0f32, 1.0f32) };
 
     let ndc = |px: f32, py: f32| -> [f32; 2] { [px / sw * 2.0 - 1.0, 1.0 - py / sh * 2.0] };
-    let v = |idx: usize, u: f32, tv: f32| SpriteVertex {
+    let v = |idx: usize, u: f32, tv: f32| ImageVertex {
         pos:       ndc(corners[idx].0, corners[idx].1),
         uv:        [u, tv],
         screen_xy: [corners[idx].0, corners[idx].1],
@@ -2528,23 +2627,23 @@ pub(crate) fn build_sprite_quad_ex(
     [tl, tr, bl, tr, br, bl]
 }
 
-/// Build a sprite quad for overlay rendering.
+/// Build a image quad for overlay rendering.
 /// x/y are virtual-screen pixel coords; win_scale_* converts them to display pixels.
 #[allow(clippy::too_many_arguments)]
-pub(crate) fn build_sprite_quad_overlay(
+pub(crate) fn build_image_quad_overlay(
     x: i32, y: i32,
-    sprite_w: u32, sprite_h: u32,
+    image_w: u32, image_h: u32,
     display_w: u32, display_h: u32,
     main_x: i32, main_y: i32,
     win_scale_x: f32, win_scale_y: f32,
     mask_ox: f32, mask_oy: f32, mask_w: f32, mask_h: f32, mask_on: f32,
-    params: &DrawSpriteParams,
-) -> [SpriteVertex; 6] {
+    params: &DrawImageParams,
+) -> [ImageVertex; 6] {
     let dw     = display_w as f32;
     let dh     = display_h as f32;
-    // Scale sprite size and position from virtual-screen pixels to display pixels
-    let draw_w = sprite_w as f32 * params.scale_x * win_scale_x;
-    let draw_h = sprite_h as f32 * params.scale_y * win_scale_y;
+    // Scale image size and position from virtual-screen pixels to display pixels
+    let draw_w = image_w as f32 * params.scale_x * win_scale_x;
+    let draw_h = image_h as f32 * params.scale_y * win_scale_y;
     let cx = x as f32 * win_scale_x + draw_w * 0.5 + main_x as f32;
     let cy = y as f32 * win_scale_y + draw_h * 0.5 + main_y as f32;
     let hw = draw_w * 0.5;
@@ -2573,7 +2672,7 @@ pub(crate) fn build_sprite_quad_overlay(
     let (u0, u1) = if params.flip_x { (1.0f32, 0.0f32) } else { (0.0f32, 1.0f32) };
     let (v0, v1) = if params.flip_y { (1.0f32, 0.0f32) } else { (0.0f32, 1.0f32) };
     let ndc = |px: f32, py: f32| -> [f32; 2] { [px / dw * 2.0 - 1.0, 1.0 - py / dh * 2.0] };
-    let sv = |idx: usize, u: f32, tv: f32| SpriteVertex {
+    let sv = |idx: usize, u: f32, tv: f32| ImageVertex {
         pos: ndc(corners[idx].0, corners[idx].1),
         uv: [u, tv],
         screen_xy: [corners[idx].0, corners[idx].1],
