@@ -96,7 +96,6 @@ init(WindowConfig {
     font_path:     None,     // デフォルトフォントファイルパス
     font_size:     16,       // デフォルトフォントサイズ
     overlay_enabled: false,  // オーバーレイウィンドウを有効化
-    overlay_visible: true,
     ..Default::default()     // 未指定フィールドはデフォルト値
 });
 
@@ -242,13 +241,12 @@ let w = get_text_width("Hello!", font);
 // WindowConfig で有効化する
 init(WindowConfig {
     overlay_enabled: true,
-    overlay_visible: true,
     ..Default::default()
 });
 
 while advance_frame() {
     // メインウィンドウへの通常描画
-    draw_image(0, x, y, player);
+    draw_image(MAIN_SCREEN, x, y, player);
 
     // オーバーレイへの描画（座標はメインウィンドウ基準、範囲外も描ける）
     overlay_draw_image(-50, 100, player);

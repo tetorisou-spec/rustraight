@@ -34,7 +34,10 @@ fn lin_to_srgb(x: f32) -> f32 {
 }
 @fragment fn fs(in: Vout) -> @location(0) vec4<f32> {
     let c = textureSample(t, s, in.uv);
-    return vec4(lin_to_srgb(c.r), lin_to_srgb(c.g), lin_to_srgb(c.b), c.a);
+    if c.a < 0.0001 { return vec4(0., 0., 0., 0.); }
+    let lin = c.rgb / c.a;
+    let srgb = vec3(lin_to_srgb(lin.r), lin_to_srgb(lin.g), lin_to_srgb(lin.b));
+    return vec4(srgb * c.a, c.a);
 }
 "#;
 
